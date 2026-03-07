@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  baseline:
+    name: Baseline checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Repository sanity check
+        run: |
+          set -euo pipefail
+          echo "CI is configured for C++ (CMake/clang) and Python."
+          if [ ! -f cpp/CMakeLists.txt ] && [ ! -f pyproject.toml ] && [ ! -f requirements.txt ]; then
+            echo "::warning::No CMake or Python project files found yet."
+          fi
+
+  cxx-format:
+    name: C++ clang-format
+    runs-on: ubuntu-latest
+    if: ${{ hashFiles('cpp/**/*.c', 'cpp/**/*.cc', 'cpp/**/*.cpp', 'cpp/**/*.cxx', 'cpp/**/*.h', 'cpp/**/*.hh', 'cpp/**/*.hpp', 'cpp/**/*.hxx') != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang-format
+
+      - name: Check formatting
+        run: |
+          set -euo pipefail
+          mapfile -t cpp_files < <(find cpp -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o -name '*.h' -o -name '*.hh' -o -name '*.hpp' -o -name '*.hxx' \) ! -path 'cpp/third_party/*' ! -path 'cpp/vendor/*')
+          if [ "${#cpp_files[@]}" -eq 0 ]; then
+            echo "No C/C++ files found."
+            exit 0
+          fi
+          clang-format --dry-run --Werror "${cpp_files[@]}"
+
+  cxx-build-and-tidy:
+    name: C++ CMake build + clang-tidy + tests
+    runs-on: ubuntu-latest
+    if: ${{ hashFiles('cpp/CMakeLists.txt') != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install C++ toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang clang-tidy
+
+      - name: Cache vcpkg artifacts
+        if: ${{ hashFiles('cpp/vcpkg.json') != '' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/vcpkg/downloads
+            ${{ github.workspace }}/.vcpkg_installed
+          key: ${{ runner.os }}-vcpkg-${{ hashFiles('cpp/vcpkg.json') }}
+
+      - name: Setup vcpkg
+        if: ${{ hashFiles('cpp/vcpkg.json') != '' }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh"
+          echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
+
+      - name: Configure (CMake)
+        run: |
+          set -euo pipefail
+          if [ -f CMakePresets.json ]; then
+            if [ -f cpp/vcpkg.json ]; then
+              cmake --preset ci-vcpkg
+            else
+              cmake --preset ci
+            fi
+          else
+            cmake -S cpp -B build/ci -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          fi
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          if [ -f CMakePresets.json ]; then
+            if [ -f cpp/vcpkg.json ]; then
+              cmake --build --preset build-ci-vcpkg --parallel
+            else
+              cmake --build --preset build-ci --parallel
+            fi
+          else
+            cmake --build build/ci --parallel
+          fi
+
+      - name: clang-tidy
+        run: |
+          set -euo pipefail
+          mapfile -t cpp_files < <(find cpp -type f \( -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \) ! -path 'cpp/third_party/*' ! -path 'cpp/vendor/*')
+          if [ "${#cpp_files[@]}" -eq 0 ]; then
+            echo "No C++ implementation files found for clang-tidy."
+            exit 0
+          fi
+          clang-tidy -p build/ci --warnings-as-errors='*' "${cpp_files[@]}"
+
+      - name: Test (ctest)
+        run: |
+          set -euo pipefail
+          if [ -f CMakePresets.json ]; then
+            if [ -f cpp/vcpkg.json ]; then
+              ctest --preset test-ci-vcpkg
+            else
+              ctest --preset test-ci
+            fi
+          else
+            ctest --test-dir build/ci --output-on-failure
+          fi
+
+  python:
+    name: Python ruff + pytest
+    runs-on: ubuntu-latest
+    if: ${{ hashFiles('pyproject.toml') != '' || hashFiles('requirements.txt') != '' || hashFiles('requirements-dev.txt') != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          if [ -f requirements-dev.txt ]; then
+            pip install -r requirements-dev.txt
+          fi
+          pip install ruff pytest
+
+      - name: Lint (ruff)
+        run: |
+          set -euo pipefail
+          ruff check .
+
+      - name: Test (pytest)
+        run: |
+          set -euo pipefail
+          if [ -d tests ] || compgen -G "*_test.py" > /dev/null || compgen -G "test_*.py" > /dev/null; then
+            pytest -q
+          else
+            echo "No Python tests found."
+          fi

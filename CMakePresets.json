@@ -1,0 +1,127 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base-clang",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "dev",
+      "displayName": "Dev (Clang Debug)",
+      "inherits": "base-clang",
+      "binaryDir": "${fileDir}/build/dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "rel",
+      "displayName": "Release-ish (Clang RelWithDebInfo)",
+      "inherits": "base-clang",
+      "binaryDir": "${fileDir}/build/rel",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "ci",
+      "displayName": "CI (Clang RelWithDebInfo)",
+      "inherits": "base-clang",
+      "binaryDir": "${fileDir}/build/ci",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "base-vcpkg",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_MANIFEST_DIR": "${fileDir}/cpp",
+        "VCPKG_INSTALLED_DIR": "${fileDir}/.vcpkg_installed"
+      }
+    },
+    {
+      "name": "dev-vcpkg",
+      "displayName": "Dev (Clang Debug + vcpkg)",
+      "inherits": ["dev", "base-vcpkg"]
+    },
+    {
+      "name": "rel-vcpkg",
+      "displayName": "Release-ish (Clang RelWithDebInfo + vcpkg)",
+      "inherits": ["rel", "base-vcpkg"]
+    },
+    {
+      "name": "ci-vcpkg",
+      "displayName": "CI (Clang RelWithDebInfo + vcpkg)",
+      "inherits": ["ci", "base-vcpkg"]
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-dev",
+      "configurePreset": "dev"
+    },
+    {
+      "name": "build-rel",
+      "configurePreset": "rel"
+    },
+    {
+      "name": "build-ci",
+      "configurePreset": "ci"
+    },
+    {
+      "name": "build-dev-vcpkg",
+      "configurePreset": "dev-vcpkg"
+    },
+    {
+      "name": "build-rel-vcpkg",
+      "configurePreset": "rel-vcpkg"
+    },
+    {
+      "name": "build-ci-vcpkg",
+      "configurePreset": "ci-vcpkg"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "test-dev",
+      "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-dev-vcpkg",
+      "configurePreset": "dev-vcpkg",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-ci",
+      "configurePreset": "ci",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-ci-vcpkg",
+      "configurePreset": "ci-vcpkg",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
