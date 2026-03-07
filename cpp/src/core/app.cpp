@@ -1,10 +1,8 @@
-#include "trading/app.hpp"
-
-#include <string_view>
+#include "trading/core/app.hpp"
 
 #include <nlohmann/json.hpp>
 
-namespace trading {
+namespace trading::core {
 
 std::string build_heartbeat_json(std::string_view mode) {
     const nlohmann::json payload{
@@ -15,4 +13,4 @@ std::string build_heartbeat_json(std::string_view mode) {
     return payload.dump();
 }
 
-} // namespace trading
+} // namespace trading::core
