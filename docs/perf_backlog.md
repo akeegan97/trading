@@ -32,6 +32,18 @@ This file tracks deliberate performance work I'm deferring, planning to run targ
    - Current state: shard run loop uses `std::this_thread::sleep_for()` when queue is empty.
    - Target: wake on producer signal (condition variable/eventfd/queue semaphore) to reduce idle CPU and wake latency.
 
+## Connection architecture candidates (medium priority)
+
+1. Move from single websocket session to partitioned multi-connection ingest.
+   - Current state: one WS connection carries all markets/channels, so reconnect/drop blast radius is global.
+   - Target: multiple WS sessions partitioned by market/channel with dedicated IO workers.
+2. Add per-session recovery and resubscribe control.
+   - Current state: reconnect strategy is effectively whole-feed.
+   - Target: recover only affected partition/session, keep unaffected partitions live.
+3. Align session partitions with router/shard topology.
+   - Current state: single ingest stream fans into shard routing.
+   - Target: map WS partitions to shard ownership boundaries to reduce cross-thread handoff pressure.
+
 ## Potential abstraction overhead checks (medium/low priority)
 
 1. Measure virtual/interface overhead in ingest boundaries.
