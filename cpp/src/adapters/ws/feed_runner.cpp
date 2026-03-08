@@ -19,9 +19,9 @@ bool WsFeedRunner::start() {
     dropped_count_.store(0, std::memory_order_relaxed);
     set_error("");
 
+    // Publish started state to readers of running().
     running_.store(true, std::memory_order_release);
-    worker_ =
-        std::jthread([this](const std::stop_token& stop_token) { run(stop_token); });
+    worker_ = std::jthread([this](const std::stop_token& stop_token) { run(stop_token); });
     return true;
 }
 
@@ -37,6 +37,7 @@ void WsFeedRunner::stop() {
     running_.store(false, std::memory_order_release);
 }
 
+// Acquire pairs with start/stop release stores.
 bool WsFeedRunner::running() const { return running_.load(std::memory_order_acquire); }
 
 uint64_t WsFeedRunner::received_count() const {

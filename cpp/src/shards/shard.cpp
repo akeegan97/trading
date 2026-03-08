@@ -4,10 +4,8 @@
 
 namespace trading::shards {
 
-Shard::Shard(ShardConfig config,
-             router::ShardedEventDispatch& dispatch,
-             IExchangeMessageParser& parser,
-             BookStore& books)
+Shard::Shard(ShardConfig config, router::ShardedEventDispatch& dispatch,
+             IExchangeMessageParser& parser, BookStore& books)
     : config_(config), dispatch_(dispatch), parser_(parser), books_(books) {}
 
 Shard::~Shard() { stop(); }
@@ -21,6 +19,7 @@ bool Shard::start() {
     parsed_.store(0, std::memory_order_relaxed);
     parse_errors_.store(0, std::memory_order_relaxed);
     applied_.store(0, std::memory_order_relaxed);
+    // Publish started state to readers of running().
     running_.store(true, std::memory_order_release);
 
     worker_ = std::jthread([this](const std::stop_token& stop_token) { run(stop_token); });
@@ -38,6 +37,7 @@ void Shard::stop() {
     running_.store(false, std::memory_order_release);
 }
 
+// Acquire pairs with start/stop release stores.
 bool Shard::running() const { return running_.load(std::memory_order_acquire); }
 
 ShardStats Shard::stats() const {
@@ -58,14 +58,19 @@ void Shard::run(const std::stop_token& stop_token) {
         }
 
         consumed_.fetch_add(1, std::memory_order_relaxed);
-        auto decoded = parser_.parse(routed);
-        if (!decoded) {
+        const auto parsed = parser_.parse(routed);
+        if (!parsed.ok()) {
+            parse_errors_.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        const auto& parsed_event = parsed.value();
+        if (!parsed_event.has_value()) {
             parse_errors_.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
 
         parsed_.fetch_add(1, std::memory_order_relaxed);
-        if (books_.apply(*decoded)) {
+        if (books_.apply(*parsed_event)) {
             applied_.fetch_add(1, std::memory_order_relaxed);
         } else {
             parse_errors_.fetch_add(1, std::memory_order_relaxed);

@@ -1,0 +1,310 @@
+#include "trading/config/trader_config.hpp"
+
+#include <cstdint>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <utility>
+
+#include <nlohmann/json.hpp>
+
+namespace trading::config {
+namespace {
+
+using nlohmann::json;
+
+bool parse_exchange_id(std::string_view name, decode::ExchangeId& out_decode,
+                       internal::ExchangeId& out_router) {
+    if (name == "kalshi") {
+        out_decode = decode::ExchangeId::kKalshi;
+        out_router = internal::ExchangeId::kKalshi;
+        return true;
+    }
+    if (name == "polymarket") {
+        out_decode = decode::ExchangeId::kPolymarket;
+        out_router = internal::ExchangeId::kPolymarket;
+        return true;
+    }
+    return false;
+}
+
+bool parse_positive_size_t(const json& value, std::size_t& out, std::string& error,
+                           std::string_view field_name) {
+    if (!value.is_number_unsigned()) {
+        error = std::string(field_name) + " must be an unsigned integer";
+        return false;
+    }
+    const auto parsed = value.get<std::size_t>();
+    if (parsed == 0) {
+        error = std::string(field_name) + " must be > 0";
+        return false;
+    }
+    out = parsed;
+    return true;
+}
+
+bool parse_non_negative_ms(const json& value, std::chrono::milliseconds& out, std::string& error,
+                           std::string_view field_name) {
+    if (!value.is_number_integer()) {
+        error = std::string(field_name) + " must be an integer";
+        return false;
+    }
+    const auto parsed = value.get<std::int64_t>();
+    if (parsed < 0) {
+        error = std::string(field_name) + " must be >= 0";
+        return false;
+    }
+    out = std::chrono::milliseconds{parsed};
+    return true;
+}
+
+bool parse_string_array(const json& value, std::vector<std::string>& out, std::string& error,
+                        std::string_view field_name) {
+    if (!value.is_array()) {
+        error = std::string(field_name) + " must be an array";
+        return false;
+    }
+
+    std::vector<std::string> parsed;
+    parsed.reserve(value.size());
+    for (const auto& item : value) {
+        if (!item.is_string()) {
+            error = std::string(field_name) + " entries must be strings";
+            return false;
+        }
+        parsed.push_back(item.get<std::string>());
+    }
+    out = std::move(parsed);
+    return true;
+}
+
+// NOLINTBEGIN(readability-function-cognitive-complexity)
+ConfigLoadResult parse_from_json(const json& root) {
+    ConfigLoadResult result{
+        .ok = true,
+        .config = TraderRuntimeConfig{},
+        .error = {},
+    };
+
+    if (!root.is_object()) {
+        result.ok = false;
+        result.error = "config root must be a JSON object";
+        return result;
+    }
+
+    if (const auto mode_it = root.find("mode"); mode_it != root.end()) {
+        if (!mode_it->is_string()) {
+            result.ok = false;
+            result.error = "mode must be a string";
+            return result;
+        }
+        result.config.mode = mode_it->get<std::string>();
+    }
+
+    if (const auto kalshi_it = root.find("kalshi"); kalshi_it != root.end()) {
+        if (!kalshi_it->is_object()) {
+            result.ok = false;
+            result.error = "kalshi must be an object";
+            return result;
+        }
+        const auto& kalshi = *kalshi_it;
+
+        if (const auto endpoint_it = kalshi.find("endpoint"); endpoint_it != kalshi.end()) {
+            if (!endpoint_it->is_string()) {
+                result.ok = false;
+                result.error = "kalshi.endpoint must be a string";
+                return result;
+            }
+            result.config.kalshi.endpoint = endpoint_it->get<std::string>();
+        }
+        if (const auto channels_it = kalshi.find("channels"); channels_it != kalshi.end()) {
+            if (!parse_string_array(channels_it.value(), result.config.kalshi.channels,
+                                    result.error, "kalshi.channels")) {
+                result.ok = false;
+                return result;
+            }
+        }
+        if (const auto creds_it = kalshi.find("credentials"); creds_it != kalshi.end()) {
+            if (!creds_it->is_object()) {
+                result.ok = false;
+                result.error = "kalshi.credentials must be an object";
+                return result;
+            }
+            const auto& creds = *creds_it;
+            if (const auto value_it = creds.find("key_id"); value_it != creds.end()) {
+                if (!value_it->is_string()) {
+                    result.ok = false;
+                    result.error = "kalshi.credentials.key_id must be a string";
+                    return result;
+                }
+                result.config.kalshi.credentials.key_id = value_it->get<std::string>();
+            }
+            if (const auto value_it = creds.find("private_key_pem"); value_it != creds.end()) {
+                if (!value_it->is_string()) {
+                    result.ok = false;
+                    result.error = "kalshi.credentials.private_key_pem must be a string";
+                    return result;
+                }
+                result.config.kalshi.credentials.private_key_pem = value_it->get<std::string>();
+            }
+            if (const auto value_it = creds.find("key_id_env"); value_it != creds.end()) {
+                if (!value_it->is_string()) {
+                    result.ok = false;
+                    result.error = "kalshi.credentials.key_id_env must be a string";
+                    return result;
+                }
+                result.config.kalshi.credentials.key_id_env = value_it->get<std::string>();
+            }
+            if (const auto value_it = creds.find("private_key_pem_env"); value_it != creds.end()) {
+                if (!value_it->is_string()) {
+                    result.ok = false;
+                    result.error = "kalshi.credentials.private_key_pem_env must be a string";
+                    return result;
+                }
+                result.config.kalshi.credentials.private_key_pem_env = value_it->get<std::string>();
+            }
+        }
+    }
+
+    if (const auto pipeline_it = root.find("pipeline"); pipeline_it != root.end()) {
+        if (!pipeline_it->is_object()) {
+            result.ok = false;
+            result.error = "pipeline must be an object";
+            return result;
+        }
+        const auto& pipeline = *pipeline_it;
+
+        if (const auto source_it = pipeline.find("source"); source_it != pipeline.end()) {
+            if (!source_it->is_string()) {
+                result.ok = false;
+                result.error = "pipeline.source must be a string";
+                return result;
+            }
+            result.config.pipeline.source = source_it->get<std::string>();
+        }
+
+        if (const auto exchange_it = pipeline.find("exchange"); exchange_it != pipeline.end()) {
+            if (!exchange_it->is_string()) {
+                result.ok = false;
+                result.error = "pipeline.exchange must be a string";
+                return result;
+            }
+            const auto exchange_name = exchange_it->get<std::string>();
+            if (!parse_exchange_id(exchange_name, result.config.pipeline.decode_exchange,
+                                   result.config.pipeline.router_exchange)) {
+                result.ok = false;
+                result.error = "pipeline.exchange must be one of: kalshi, polymarket";
+                return result;
+            }
+        }
+
+        if (const auto frame_pool_it = pipeline.find("frame_pool_capacity");
+            frame_pool_it != pipeline.end()) {
+            if (!parse_positive_size_t(frame_pool_it.value(),
+                                       result.config.pipeline.frame_pool_capacity, result.error,
+                                       "pipeline.frame_pool_capacity")) {
+                result.ok = false;
+                return result;
+            }
+        }
+        if (const auto frame_queue_it = pipeline.find("frame_queue_capacity");
+            frame_queue_it != pipeline.end()) {
+            if (!parse_positive_size_t(frame_queue_it.value(),
+                                       result.config.pipeline.frame_queue_capacity, result.error,
+                                       "pipeline.frame_queue_capacity")) {
+                result.ok = false;
+                return result;
+            }
+        }
+        if (const auto shard_count_it = pipeline.find("shard_count");
+            shard_count_it != pipeline.end()) {
+            if (!parse_positive_size_t(shard_count_it.value(), result.config.pipeline.shard_count,
+                                       result.error, "pipeline.shard_count")) {
+                result.ok = false;
+                return result;
+            }
+        }
+        if (const auto shard_queue_it = pipeline.find("per_shard_queue_capacity");
+            shard_queue_it != pipeline.end()) {
+            if (!parse_positive_size_t(shard_queue_it.value(),
+                                       result.config.pipeline.per_shard_queue_capacity,
+                                       result.error, "pipeline.per_shard_queue_capacity")) {
+                result.ok = false;
+                return result;
+            }
+        }
+        if (const auto shard_idle_it = pipeline.find("shard_idle_sleep_ms");
+            shard_idle_it != pipeline.end()) {
+            if (!parse_non_negative_ms(shard_idle_it.value(),
+                                       result.config.pipeline.shard_idle_sleep, result.error,
+                                       "pipeline.shard_idle_sleep_ms")) {
+                result.ok = false;
+                return result;
+            }
+        }
+    }
+
+    if (const auto runtime_it = root.find("runtime"); runtime_it != root.end()) {
+        if (!runtime_it->is_object()) {
+            result.ok = false;
+            result.error = "runtime must be an object";
+            return result;
+        }
+        const auto& runtime = *runtime_it;
+
+        if (const auto pump_batch_it = runtime.find("pump_batch_size");
+            pump_batch_it != runtime.end()) {
+            if (!parse_positive_size_t(pump_batch_it.value(), result.config.pump_batch_size,
+                                       result.error, "runtime.pump_batch_size")) {
+                result.ok = false;
+                return result;
+            }
+        }
+        if (const auto idle_it = runtime.find("pump_idle_sleep_ms"); idle_it != runtime.end()) {
+            if (!parse_non_negative_ms(idle_it.value(), result.config.pump_idle_sleep, result.error,
+                                       "runtime.pump_idle_sleep_ms")) {
+                result.ok = false;
+                return result;
+            }
+        }
+    }
+
+    return result;
+}
+// NOLINTEND(readability-function-cognitive-complexity)
+
+} // namespace
+
+ConfigLoadResult load_trader_config_from_json(std::string_view json_text) {
+    try {
+        const json root = json::parse(json_text);
+        return parse_from_json(root);
+    } catch (const std::exception& exception) {
+        return ConfigLoadResult{
+            .ok = false,
+            .config = TraderRuntimeConfig{},
+            .error = std::string{"failed to parse config JSON: "} + exception.what(),
+        };
+    }
+}
+
+ConfigLoadResult load_trader_config_from_file(const std::string& path) {
+    std::ifstream config_stream(path);
+    if (!config_stream) {
+        return ConfigLoadResult{
+            .ok = false,
+            .config = TraderRuntimeConfig{},
+            .error = "failed to open config file: " + path,
+        };
+    }
+
+    std::stringstream buffer;
+    buffer << config_stream.rdbuf();
+    auto result = load_trader_config_from_json(buffer.str());
+    if (!result.ok && result.error.find(path) == std::string::npos) {
+        result.error = path + ": " + result.error;
+    }
+    return result;
+}
+
+} // namespace trading::config

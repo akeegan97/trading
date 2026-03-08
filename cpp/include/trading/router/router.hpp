@@ -5,13 +5,15 @@
 
 #include "trading/decode/dispatch.hpp"
 #include "trading/ingest/raw_frame.hpp"
+#include "trading/internal/market_types.hpp"
 #include "trading/router/shard_dispatch.hpp"
 
 namespace trading::router {
 
 class Router {
   public:
-    Router(decode::DecodeFn decode_fn, IShardDispatch& shard_dispatch, std::size_t shard_count);
+    Router(decode::DecodeFn decode_fn, IShardDispatch& shard_dispatch, std::size_t shard_count,
+           internal::ExchangeId exchange_id = internal::ExchangeId::kKalshi);
 
     [[nodiscard]] bool route(const ingest::RawFrame& frame);
 
@@ -22,6 +24,7 @@ class Router {
     decode::DecodeFn decode_fn_;
     IShardDispatch& shard_dispatch_;
     std::size_t shard_count_;
+    internal::ExchangeId exchange_id_;
 };
 
 } // namespace trading::router

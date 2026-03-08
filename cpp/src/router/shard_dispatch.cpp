@@ -17,22 +17,26 @@ SpscRoutedEventQueue::SpscRoutedEventQueue(std::size_t capacity)
 bool SpscRoutedEventQueue::try_push(const RoutedEvent& event) noexcept {
     const std::size_t head = head_.load(std::memory_order_relaxed);
     const std::size_t next_head = increment(head);
+    // Acquire pairs with consumer tail release for correct full/empty state.
     if (next_head == tail_.load(std::memory_order_acquire)) {
         return false;
     }
 
     buffer_[head] = event;
+    // Publish event payload before publishing updated head.
     head_.store(next_head, std::memory_order_release);
     return true;
 }
 
 bool SpscRoutedEventQueue::try_pop(RoutedEvent& event_out) noexcept {
     const std::size_t tail = tail_.load(std::memory_order_relaxed);
+    // Acquire pairs with producer head release so event fields are visible.
     if (tail == head_.load(std::memory_order_acquire)) {
         return false;
     }
 
     event_out = std::move(buffer_[tail]);
+    // Publish consumed slot after move from buffer_ is complete.
     tail_.store(increment(tail), std::memory_order_release);
     return true;
 }
@@ -53,8 +57,7 @@ ShardedEventDispatch::ShardedEventDispatch(ShardedEventDispatchConfig config) {
     }
 }
 
-bool ShardedEventDispatch::dispatch(const RouteKey& route_key,
-                                    const model::NormalizedEvent& event) {
+bool ShardedEventDispatch::dispatch(const RouteKey& route_key, const RoutedFrame& frame) {
     if (route_key.shard_id >= shard_queues_.size()) {
         dropped_count_.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -62,7 +65,7 @@ bool ShardedEventDispatch::dispatch(const RouteKey& route_key,
 
     RoutedEvent routed{
         .route_key = route_key,
-        .event = event,
+        .frame = frame,
     };
     if (!shard_queues_[route_key.shard_id]->try_push(routed)) {
         dropped_count_.fetch_add(1, std::memory_order_relaxed);
@@ -84,10 +87,9 @@ std::size_t ShardedEventDispatch::dropped_count() const {
     return dropped_count_.load(std::memory_order_relaxed);
 }
 
-bool NoopShardDispatch::dispatch(const RouteKey& route_key,
-                                 const model::NormalizedEvent& event) {
+bool NoopShardDispatch::dispatch(const RouteKey& route_key, const RoutedFrame& frame) {
     (void)route_key;
-    (void)event;
+    (void)frame;
     dispatched_count_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }

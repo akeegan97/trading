@@ -28,6 +28,9 @@ This file tracks deliberate performance work I'm deferring, planning to run targ
 4. Decide trade ID mode.
    - Keep `std::optional<std::string>` for correctness/audit.
    - Option: hash-only trade ID in strict low-latency mode.
+5. Replace shard idle polling with blocking wakeup.
+   - Current state: shard run loop uses `std::this_thread::sleep_for()` when queue is empty.
+   - Target: wake on producer signal (condition variable/eventfd/queue semaphore) to reduce idle CPU and wake latency.
 
 ## Potential abstraction overhead checks (medium/low priority)
 

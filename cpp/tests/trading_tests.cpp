@@ -1,22 +1,28 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <optional>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "support/fake_ws_transport.hpp"
 #include "trading/adapters/exchanges/kalshi/auth_signer.hpp"
 #include "trading/adapters/exchanges/kalshi/ws_adapter.hpp"
 #include "trading/adapters/ws/session.hpp"
+#include "trading/config/trader_config.hpp"
+#include "trading/decode/exchanges/kalshi/extractor.hpp"
 #include "trading/decode/extracted_fields.hpp"
 #include "trading/engine/runtime.hpp"
 #include "trading/ingest/raw_frame.hpp"
 #include "trading/internal/normalized_event.hpp"
 #include "trading/internal/router_frame.hpp"
 #include "trading/parsers/exchanges/kalshi/parser.hpp"
+#include "trading/pipeline/live_pipeline.hpp"
 #include "trading/router/router.hpp"
 #include "trading/router/shard_dispatch.hpp"
+#include "trading/shards/book_store.hpp"
 #include "trading/shards/message_parser.hpp"
 
 namespace {
@@ -71,8 +77,7 @@ trading::decode::ExtractedFields passthrough_decode(const trading::ingest::RawFr
     };
 }
 
-trading::ingest::RawFrame make_raw_frame(std::string ticker,
-                                         std::string payload,
+trading::ingest::RawFrame make_raw_frame(std::string ticker, std::string payload,
                                          std::uint64_t seq_id) {
     trading::ingest::RawFrame frame{};
     frame.recv_timestamp = std::chrono::steady_clock::now();
@@ -83,8 +88,8 @@ trading::ingest::RawFrame make_raw_frame(std::string ticker,
     return frame;
 }
 
-std::vector<trading::router::RoutedEvent> drain_all_shards(
-    trading::router::ShardedEventDispatch& shard_dispatch) {
+std::vector<trading::router::RoutedEvent>
+drain_all_shards(trading::router::ShardedEventDispatch& shard_dispatch) {
     std::vector<trading::router::RoutedEvent> drained;
     for (std::size_t shard_id = 0; shard_id < shard_dispatch.shard_count(); ++shard_id) {
         trading::router::RoutedEvent routed{};
@@ -95,28 +100,33 @@ std::vector<trading::router::RoutedEvent> drain_all_shards(
     return drained;
 }
 
-trading::router::RoutedEvent make_routed_event(std::string raw_payload,
-                                               std::string market_ticker,
-                                               std::optional<std::uint64_t> seq_id) {
+trading::router::RoutedEvent make_routed_event(
+    std::string raw_payload, std::string market_ticker, std::optional<std::uint64_t> seq_id,
+    trading::internal::ExchangeId exchange_id = trading::internal::ExchangeId::kKalshi) {
+    const auto recv_count = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+    const auto recv_ns =
+        recv_count > 0 ? static_cast<trading::internal::TimestampNs>(recv_count) : 0U;
     return trading::router::RoutedEvent{
         .route_key =
             {
                 .market_ticker = market_ticker,
                 .shard_id = 0,
             },
-        .event =
+        .frame =
             {
-                .recv_timestamp = std::chrono::steady_clock::now(),
-                .source = "kalshi",
+                .exchange = exchange_id,
                 .market_ticker = std::move(market_ticker),
-                .seq_id = seq_id,
+                .sequence_id = seq_id,
+                .recv_ns = recv_ns,
                 .raw_payload = std::move(raw_payload),
             },
     };
 }
 
-std::optional<std::size_t> common_shard_id(
-    const std::vector<trading::router::RoutedEvent>& routed_events) {
+std::optional<std::size_t>
+common_shard_id(const std::vector<trading::router::RoutedEvent>& routed_events) {
     if (routed_events.empty()) {
         return std::nullopt;
     }
@@ -130,20 +140,10 @@ std::optional<std::size_t> common_shard_id(
     return first_shard_id;
 }
 
-const trading::shards::DecodedMessage& require_decoded(
-    const std::optional<trading::shards::DecodedMessage>& decoded) {
-    EXPECT_TRUE(decoded.has_value());
-    static const trading::shards::DecodedMessage kEmpty{};
-    if (!decoded.has_value()) {
-        return kEmpty;
-    }
-    return decoded.value();
-}
-
 void expect_all_market_tickers(const std::vector<trading::router::RoutedEvent>& routed_events,
                                std::string_view expected_market_ticker) {
     for (const auto& routed : routed_events) {
-        EXPECT_EQ(routed.event.market_ticker, expected_market_ticker);
+        EXPECT_EQ(routed.frame.market_ticker, expected_market_ticker);
     }
 }
 
@@ -151,10 +151,67 @@ const trading::internal::NormalizedEvent& require_parsed(
     const trading::parsers::ParseResult<trading::internal::NormalizedEvent>& parsed_result) {
     EXPECT_TRUE(parsed_result.ok()) << " parse_error=" << static_cast<int>(parsed_result.error());
     static const trading::internal::NormalizedEvent kEmpty{};
-    if (!parsed_result.ok()) {
+    const auto& parsed_value = parsed_result.value();
+    if (!parsed_result.ok() || !parsed_value.has_value()) {
         return kEmpty;
     }
-    return parsed_result.value().value();
+    return *parsed_value;
+}
+
+trading::internal::NormalizedEvent
+make_snapshot_event(std::string ticker, std::optional<trading::internal::SequenceId> sequence_id,
+                    std::vector<trading::internal::Level> bids,
+                    std::vector<trading::internal::Level> asks) {
+    trading::internal::NormalizedEvent event{};
+    event.type = trading::internal::EventType::kSnapshot;
+    event.market_ticker = std::move(ticker);
+    event.raw_sequence_id = sequence_id;
+    if (sequence_id.has_value()) {
+        event.meta.sequence_id = sequence_id.value();
+    }
+    event.data = trading::internal::SnapshotData{
+        .bids = std::move(bids),
+        .asks = std::move(asks),
+    };
+    return event;
+}
+
+trading::internal::NormalizedEvent
+make_delta_event(std::string ticker, std::optional<trading::internal::SequenceId> sequence_id,
+                 trading::internal::Side side, trading::internal::PriceTicks price_ticks,
+                 trading::internal::QtyLots delta_qty_lots) {
+    trading::internal::NormalizedEvent event{};
+    event.type = trading::internal::EventType::kDelta;
+    event.market_ticker = std::move(ticker);
+    event.raw_sequence_id = sequence_id;
+    if (sequence_id.has_value()) {
+        event.meta.sequence_id = sequence_id.value();
+    }
+    event.data = trading::internal::DeltaData{
+        .side = side,
+        .price_ticks = price_ticks,
+        .delta_qty_lots = delta_qty_lots,
+    };
+    return event;
+}
+
+trading::internal::NormalizedEvent
+make_trade_event(std::string ticker, std::optional<trading::internal::SequenceId> sequence_id,
+                 trading::internal::PriceTicks price_ticks, trading::internal::QtyLots qty_lots) {
+    trading::internal::NormalizedEvent event{};
+    event.type = trading::internal::EventType::kTrade;
+    event.market_ticker = std::move(ticker);
+    event.raw_sequence_id = sequence_id;
+    if (sequence_id.has_value()) {
+        event.meta.sequence_id = sequence_id.value();
+    }
+    event.data = trading::internal::TradeData{
+        .price_ticks = price_ticks,
+        .qty_lots = qty_lots,
+        .aggressor = trading::internal::Side::kBuy,
+        .trade_id = std::optional<std::string>{"trade-1"},
+    };
+    return event;
 }
 
 TEST(TradingCoreTest, StartupPayloadHasExpectedFields) {
@@ -164,6 +221,61 @@ TEST(TradingCoreTest, StartupPayloadHasExpectedFields) {
     EXPECT_EQ(startup_json.at("service"), "trading_engine");
     EXPECT_EQ(startup_json.at("status"), "ok");
     EXPECT_EQ(startup_json.at("mode"), "test");
+}
+
+TEST(TraderConfigTest, ParsesDropFileOverrides) {
+    constexpr std::string_view kConfig = R"({
+        "mode": "paper",
+        "kalshi": {
+            "endpoint": "wss://api.elections.kalshi.com/trade-api/ws/v2",
+            "channels": ["orderbook_delta", "trade"],
+            "credentials": {
+                "key_id_env": "MY_KEY_ENV",
+                "private_key_pem_env": "MY_PEM_ENV"
+            }
+        },
+        "pipeline": {
+            "source": "kalshi-live",
+            "exchange": "kalshi",
+            "frame_pool_capacity": 2048,
+            "frame_queue_capacity": 2048,
+            "shard_count": 8,
+            "per_shard_queue_capacity": 512,
+            "shard_idle_sleep_ms": 0
+        },
+        "runtime": {
+            "pump_batch_size": 256,
+            "pump_idle_sleep_ms": 2
+        }
+    })";
+
+    const auto loaded = trading::config::load_trader_config_from_json(kConfig);
+    ASSERT_TRUE(loaded.ok) << loaded.error;
+
+    EXPECT_EQ(loaded.config.mode, "paper");
+    EXPECT_EQ(loaded.config.kalshi.channels.size(), 2U);
+    EXPECT_EQ(loaded.config.kalshi.channels[0], "orderbook_delta");
+    EXPECT_EQ(loaded.config.kalshi.credentials.key_id_env, "MY_KEY_ENV");
+    EXPECT_EQ(loaded.config.kalshi.credentials.private_key_pem_env, "MY_PEM_ENV");
+    EXPECT_EQ(loaded.config.pipeline.source, "kalshi-live");
+    EXPECT_EQ(loaded.config.pipeline.decode_exchange, trading::decode::ExchangeId::kKalshi);
+    EXPECT_EQ(loaded.config.pipeline.router_exchange, trading::internal::ExchangeId::kKalshi);
+    EXPECT_EQ(loaded.config.pipeline.frame_pool_capacity, 2048U);
+    EXPECT_EQ(loaded.config.pipeline.shard_count, 8U);
+    EXPECT_EQ(loaded.config.pump_batch_size, 256U);
+    EXPECT_EQ(loaded.config.pump_idle_sleep, std::chrono::milliseconds{2});
+}
+
+TEST(TraderConfigTest, RejectsUnknownExchange) {
+    constexpr std::string_view kConfig = R"({
+        "pipeline": {
+            "exchange": "unknown-x"
+        }
+    })";
+
+    const auto loaded = trading::config::load_trader_config_from_json(kConfig);
+    EXPECT_FALSE(loaded.ok);
+    EXPECT_NE(loaded.error.find("pipeline.exchange"), std::string::npos);
 }
 
 TEST(WsSessionTest, ConnectBuildsKalshiHeaders) {
@@ -218,9 +330,9 @@ TEST(RouterTest, RoutesEventIntoExactlyOneShardQueue) {
 
     const auto routed_events = drain_all_shards(shard_dispatch);
     ASSERT_EQ(routed_events.size(), 1U);
-    EXPECT_EQ(routed_events[0].event.market_ticker, frame.market_ticker);
-    ASSERT_TRUE(routed_events[0].event.seq_id.has_value());
-    EXPECT_EQ(routed_events[0].event.seq_id.value_or(0U), kFirstSeqId);
+    EXPECT_EQ(routed_events[0].frame.market_ticker, frame.market_ticker);
+    ASSERT_TRUE(routed_events[0].frame.sequence_id.has_value());
+    EXPECT_EQ(routed_events[0].frame.sequence_id.value_or(0U), kFirstSeqId);
     EXPECT_LT(routed_events[0].route_key.shard_id, kShardCount);
     EXPECT_EQ(shard_dispatch.dropped_count(), 0U);
 }
@@ -257,92 +369,185 @@ TEST(RouterTest, RoutesSameMarketToSameShard) {
     EXPECT_EQ(shard_dispatch.dropped_count(), 0U);
 }
 
-TEST(MessageParserTest, ParsesSnapshotPayloadIntoStructuredLevels) {
-    constexpr std::uint64_t kExpectedSeqId = 42;
-    const auto routed_event =
-        make_routed_event(R"({
-            "type":"snapshot",
-            "market_ticker":"KXBTC-YES",
-            "seq":42,
-            "bids":[[100.5,3],[100.0,2]],
-            "asks":[[101.0,1]]
-        })",
-                          "ignored",
-                          std::nullopt);
-    const trading::shards::HeuristicMessageParser parser;
-    const auto decoded = parser.parse(routed_event);
+TEST(BookStoreTest, SnapshotBuildsBidAskState) {
+    trading::shards::BookStore books;
+    const auto snapshot_event =
+        make_snapshot_event("KXBTC-YES", 10U, {{100, 5}, {99, 2}}, {{101, 3}, {102, 1}});
 
-    const auto& parsed = require_decoded(decoded);
-    EXPECT_EQ(parsed.type, trading::shards::DecodedMessageType::kSnapshot);
-    EXPECT_EQ(parsed.market_ticker, "KXBTC-YES");
-    EXPECT_EQ(parsed.seq_id.value_or(0U), kExpectedSeqId);
-
-    const auto* snapshot = std::get_if<trading::shards::SnapshotPayload>(&parsed.data);
-    ASSERT_NE(snapshot, nullptr);
-    ASSERT_EQ(snapshot->bids.size(), 2U);
-    ASSERT_EQ(snapshot->asks.size(), 1U);
-    EXPECT_DOUBLE_EQ(snapshot->bids[0].price, 100.5);
-    EXPECT_DOUBLE_EQ(snapshot->bids[0].quantity, 3.0);
+    ASSERT_TRUE(books.apply(snapshot_event));
+    const auto* state = books.find("KXBTC-YES");
+    ASSERT_NE(state, nullptr);
+    EXPECT_EQ(state->snapshot_count, 1U);
+    EXPECT_EQ(state->delta_count, 0U);
+    EXPECT_EQ(state->trade_count, 0U);
+    ASSERT_TRUE(state->last_seq_id.has_value());
+    EXPECT_EQ(state->last_seq_id.value_or(0U), 10U);
+    ASSERT_EQ(state->bids.size(), 2U);
+    ASSERT_EQ(state->asks.size(), 2U);
+    EXPECT_EQ(state->bids.begin()->first, 100);
+    EXPECT_EQ(state->bids.begin()->second, 5);
+    EXPECT_EQ(state->asks.begin()->first, 101);
+    EXPECT_EQ(state->asks.begin()->second, 3);
 }
 
-TEST(MessageParserTest, ParsesTradePayloadWithNestedDataObject) {
-    constexpr std::uint64_t kExpectedSeqId = 77;
+TEST(BookStoreTest, DeltaUpdatesAndRemovesLevels) {
+    trading::shards::BookStore books;
+    ASSERT_TRUE(books.apply(make_snapshot_event("KXBTC-YES", 1U, {{100, 5}}, {{101, 3}})));
+
+    ASSERT_TRUE(
+        books.apply(make_delta_event("KXBTC-YES", 2U, trading::internal::Side::kBid, 100, -2)));
+    ASSERT_TRUE(
+        books.apply(make_delta_event("KXBTC-YES", 3U, trading::internal::Side::kBid, 100, -3)));
+    ASSERT_TRUE(
+        books.apply(make_delta_event("KXBTC-YES", 4U, trading::internal::Side::kAsk, 102, 4)));
+
+    const auto* state = books.find("KXBTC-YES");
+    ASSERT_NE(state, nullptr);
+    EXPECT_EQ(state->delta_count, 3U);
+    EXPECT_EQ(state->bids.count(100), 0U);
+    ASSERT_EQ(state->asks.count(102), 1U);
+    EXPECT_EQ(state->asks.at(102), 4);
+    ASSERT_TRUE(state->last_seq_id.has_value());
+    EXPECT_EQ(state->last_seq_id.value_or(0U), 4U);
+}
+
+// NOLINTBEGIN(readability-function-cognitive-complexity)
+TEST(BookStoreTest, SequencePolicyRejectsStaleAndAcceptsNonContiguous) {
+    trading::shards::BookStore books;
+    ASSERT_TRUE(books.apply(make_snapshot_event("KXBTC-YES", 5U, {{100, 5}}, {{101, 5}})));
+
+    EXPECT_FALSE(
+        books.apply(make_delta_event("KXBTC-YES", 4U, trading::internal::Side::kBid, 100, 1)));
+    ASSERT_TRUE(books.apply(make_trade_event("KXBTC-YES", 8U, 100, 2)));
+
+    const auto* state = books.find("KXBTC-YES");
+    ASSERT_NE(state, nullptr);
+    EXPECT_EQ(state->stale_sequence_count, 1U);
+    EXPECT_EQ(state->trade_count, 1U);
+    ASSERT_TRUE(state->last_trade.has_value());
+    if (state->last_trade.has_value()) {
+        EXPECT_EQ(state->last_trade.value().price_ticks, 100);
+    }
+    ASSERT_TRUE(state->last_seq_id.has_value());
+    EXPECT_EQ(state->last_seq_id.value_or(0U), 8U);
+}
+// NOLINTEND(readability-function-cognitive-complexity)
+
+TEST(RoutedEventParserTest, ParsesKalshiSnapshotFromRoutedEvent) {
     const auto routed_event = make_routed_event(
         R"({
-            "type":"trade",
-            "data":{
-              "market_ticker":"KXBTC-YES",
-              "seq_id":"77",
-              "price":"101.25",
-              "size":"4",
-              "side":"YES"
+            "type": "orderbook_snapshot",
+            "sid": 3,
+            "seq": 2,
+            "msg": {
+                "market_ticker": "FED-23DEC-T3.00",
+                "yes": [[95, 54], [94, 1]],
+                "no": [[7, 87], [6, 32]]
             }
         })",
-        "",
-        std::nullopt);
-    const trading::shards::HeuristicMessageParser parser;
-    const auto decoded = parser.parse(routed_event);
+        "FED-23DEC-T3.00", std::nullopt);
 
-    const auto& parsed = require_decoded(decoded);
-    EXPECT_EQ(parsed.type, trading::shards::DecodedMessageType::kTrade);
-    EXPECT_EQ(parsed.market_ticker, "KXBTC-YES");
-    EXPECT_EQ(parsed.seq_id.value_or(0U), kExpectedSeqId);
+    const trading::shards::RoutedEventParser parser;
+    const auto parsed_result = parser.parse(routed_event);
+    const auto& parsed = require_parsed(parsed_result);
 
-    const auto* trade = std::get_if<trading::shards::TradePayload>(&parsed.data);
-    ASSERT_NE(trade, nullptr);
-    EXPECT_DOUBLE_EQ(trade->price, 101.25);
-    EXPECT_DOUBLE_EQ(trade->quantity, 4.0);
-    EXPECT_EQ(trade->side, "yes");
+    EXPECT_EQ(parsed.type, trading::internal::EventType::kSnapshot);
+    ASSERT_TRUE(parsed.raw_sequence_id.has_value());
+    EXPECT_EQ(parsed.raw_sequence_id.value_or(0U), 2U);
 }
 
-TEST(MessageParserTest, FallsBackToRoutedMetadataWhenJsonFieldsMissing) {
-    constexpr std::uint64_t kExpectedSeqId = 555;
-    const auto routed_event = make_routed_event(
-        R"({
-            "type":"delta",
-            "bids":[{"price":100.0,"size":1.0}]
-        })",
-        "KXBTC-YES",
-        kExpectedSeqId);
-    const trading::shards::HeuristicMessageParser parser;
-    const auto decoded = parser.parse(routed_event);
+TEST(RoutedEventParserTest, RejectsUnsupportedExchange) {
+    const auto routed_event = make_routed_event(R"({"type":"trade"})", "ANY", std::nullopt,
+                                                trading::internal::ExchangeId::kUnknown);
 
-    const auto& parsed = require_decoded(decoded);
-    EXPECT_EQ(parsed.type, trading::shards::DecodedMessageType::kDelta);
-    EXPECT_EQ(parsed.market_ticker, "KXBTC-YES");
-    EXPECT_EQ(parsed.seq_id.value_or(0U), kExpectedSeqId);
-
-    const auto* delta = std::get_if<trading::shards::DeltaPayload>(&parsed.data);
-    ASSERT_NE(delta, nullptr);
-    ASSERT_EQ(delta->bids.size(), 1U);
-    EXPECT_DOUBLE_EQ(delta->bids[0].price, 100.0);
+    const trading::shards::RoutedEventParser parser;
+    const auto parsed_result = parser.parse(routed_event);
+    EXPECT_FALSE(parsed_result.ok());
+    EXPECT_EQ(parsed_result.error(), trading::parsers::ParseError::kUnsupportedMessageType);
 }
 
-TEST(MessageParserTest, RejectsInvalidJsonPayload) {
-    const auto routed_event = make_routed_event("{ not-json", "KXBTC-YES", 1);
-    const trading::shards::HeuristicMessageParser parser;
-    EXPECT_FALSE(parser.parse(routed_event).has_value());
+TEST(KalshiDecodeExtractorTest, ExtractsTickerAndSequenceFromSnapshotPayload) {
+    trading::ingest::RawFrame frame{};
+    frame.recv_timestamp = std::chrono::steady_clock::now();
+    frame.source = "kalshi";
+    frame.payload = R"({
+        "type": "orderbook_snapshot",
+        "sid": 3,
+        "seq": 2,
+        "msg": {
+            "market_ticker": "FED-23DEC-T3.00",
+            "yes": [[95, 54]],
+            "no": [[7, 87]]
+        }
+    })";
+
+    const auto extracted = trading::decode::exchanges::kalshi::extract(frame);
+    EXPECT_TRUE(extracted.ok());
+    EXPECT_EQ(extracted.market_ticker, "FED-23DEC-T3.00");
+    ASSERT_TRUE(extracted.seq_id.has_value());
+    EXPECT_EQ(extracted.seq_id.value_or(0U), 2U);
 }
+
+// NOLINTBEGIN(readability-function-cognitive-complexity)
+TEST(LivePipelineTest, RoutesMessageFromSinkThroughRouterIntoShardBooks) {
+    constexpr std::string_view kTicker = "FED-23DEC-T3.00";
+    constexpr std::string_view kPayload = R"({
+        "type": "orderbook_snapshot",
+        "sid": 3,
+        "seq": 2,
+        "msg": {
+            "market_ticker": "FED-23DEC-T3.00",
+            "yes": [[95, 54], [94, 1]],
+            "no": [[7, 87], [6, 32]]
+        }
+    })";
+    constexpr std::size_t kQueueCapacity = 64;
+    constexpr std::size_t kShardCount = 4;
+    constexpr int kMaxAttempts = 200;
+
+    trading::pipeline::LivePipeline pipeline{
+        trading::pipeline::LivePipelineConfig{
+            .source = "kalshi",
+            .decode_exchange = trading::decode::ExchangeId::kKalshi,
+            .router_exchange = trading::internal::ExchangeId::kKalshi,
+            .frame_pool_capacity = kQueueCapacity,
+            .frame_queue_capacity = kQueueCapacity,
+            .shard_count = kShardCount,
+            .per_shard_queue_capacity = kQueueCapacity,
+            .shard_idle_sleep = std::chrono::milliseconds{1},
+        },
+    };
+    ASSERT_TRUE(pipeline.start());
+
+    auto& sink = pipeline.message_sink();
+    ASSERT_TRUE(sink.push_message(std::string{kPayload}));
+
+    bool found_book = false;
+    for (int attempt = 0; attempt < kMaxAttempts && !found_book; ++attempt) {
+        (void)pipeline.pump_ingest(kQueueCapacity);
+        for (std::size_t shard_id = 0; shard_id < pipeline.shard_count(); ++shard_id) {
+            const auto* books = pipeline.book_store(shard_id);
+            if (books == nullptr) {
+                continue;
+            }
+            if (books->find(kTicker) != nullptr) {
+                found_book = true;
+                break;
+            }
+        }
+        if (!found_book) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+    }
+
+    const auto pipeline_stats = pipeline.stats();
+    pipeline.stop();
+
+    EXPECT_TRUE(found_book);
+    EXPECT_GE(pipeline_stats.ingest_frames_pumped, 1U);
+    EXPECT_GE(pipeline_stats.route_success, 1U);
+}
+// NOLINTEND(readability-function-cognitive-complexity)
 
 TEST(KalshiParserTest, ParsesOrderbookSnapshotDocsExample) {
     constexpr std::string_view kTicker = "FED-23DEC-T3.00";
@@ -371,7 +576,7 @@ TEST(KalshiParserTest, ParsesOrderbookSnapshotDocsExample) {
     EXPECT_EQ(event.type, trading::internal::EventType::kSnapshot);
     EXPECT_EQ(event.meta.exchange, trading::internal::ExchangeId::kKalshi);
     ASSERT_TRUE(event.raw_sequence_id.has_value());
-    EXPECT_EQ(event.raw_sequence_id.value(), 2U);
+    EXPECT_EQ(event.raw_sequence_id.value_or(0U), 2U);
     EXPECT_EQ(event.meta.sequence_id, 2U);
 
     const auto* snapshot = std::get_if<trading::internal::SnapshotData>(&event.data);
@@ -411,7 +616,7 @@ TEST(KalshiParserTest, ParsesOrderbookDeltaDocsExample) {
 
     EXPECT_EQ(event.type, trading::internal::EventType::kDelta);
     ASSERT_TRUE(event.raw_sequence_id.has_value());
-    EXPECT_EQ(event.raw_sequence_id.value(), 3U);
+    EXPECT_EQ(event.raw_sequence_id.value_or(0U), 3U);
     EXPECT_EQ(event.meta.sequence_id, 3U);
 
     const auto* delta = std::get_if<trading::internal::DeltaData>(&event.data);

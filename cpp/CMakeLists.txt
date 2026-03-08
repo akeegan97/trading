@@ -17,7 +17,7 @@ add_library(trading_core src/core/app.cpp)
 target_include_directories(trading_core PUBLIC include)
 target_link_libraries(trading_core PUBLIC nlohmann_json::nlohmann_json)
 
-add_library(trading_engine src/engine/runtime.cpp)
+add_library(trading_engine src/engine/runtime.cpp src/config/trader_config.cpp)
 target_include_directories(trading_engine PUBLIC include)
 target_link_libraries(trading_engine PUBLIC trading_core)
 
@@ -47,6 +47,7 @@ add_library(
   trading_pipeline
   src/ingest/frame_pool.cpp
   src/ingest/ws_message_sink.cpp
+  src/pipeline/live_pipeline.cpp
   src/decode/dispatch.cpp
   src/decode/exchanges/kalshi/extractor.cpp
   src/decode/exchanges/polymarket/extractor.cpp
@@ -71,6 +72,7 @@ target_link_libraries(
   PRIVATE trading_engine
           trading_adapters_logging
           trading_adapters_ws
+          trading_pipeline
 )
 
 add_executable(logger_app apps/logger/main.cpp)
