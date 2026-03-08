@@ -3,23 +3,33 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
-#include "trading/model/normalized_event.hpp"
+#include "trading/internal/market_types.hpp"
 #include "trading/router/route_key.hpp"
 
 namespace trading::router {
+
+struct RoutedFrame {
+    internal::ExchangeId exchange{internal::ExchangeId::kUnknown};
+    std::string market_ticker;
+    std::optional<internal::SequenceId> sequence_id;
+    internal::TimestampNs recv_ns{0};
+    std::string raw_payload;
+};
 
 class IShardDispatch {
   public:
     virtual ~IShardDispatch() = default;
 
-    virtual bool dispatch(const RouteKey& route_key, const model::NormalizedEvent& event) = 0;
+    virtual bool dispatch(const RouteKey& route_key, const RoutedFrame& frame) = 0;
 };
 
 struct RoutedEvent {
     RouteKey route_key;
-    model::NormalizedEvent event;
+    RoutedFrame frame;
 };
 
 class SpscRoutedEventQueue {
@@ -50,7 +60,7 @@ class ShardedEventDispatch final : public IShardDispatch {
   public:
     explicit ShardedEventDispatch(ShardedEventDispatchConfig config);
 
-    bool dispatch(const RouteKey& route_key, const model::NormalizedEvent& event) override;
+    bool dispatch(const RouteKey& route_key, const RoutedFrame& frame) override;
     [[nodiscard]] bool try_pop(std::size_t shard_id, RoutedEvent& event_out);
     [[nodiscard]] std::size_t shard_count() const;
     [[nodiscard]] std::size_t dropped_count() const;
@@ -62,7 +72,7 @@ class ShardedEventDispatch final : public IShardDispatch {
 
 class NoopShardDispatch final : public IShardDispatch {
   public:
-    bool dispatch(const RouteKey& route_key, const model::NormalizedEvent& event) override;
+    bool dispatch(const RouteKey& route_key, const RoutedFrame& frame) override;
     [[nodiscard]] std::size_t dispatched_count() const;
 
   private:

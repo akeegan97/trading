@@ -7,7 +7,7 @@
 #include <string_view>
 #include <unordered_map>
 
-#include "trading/shards/decoded_message.hpp"
+#include "trading/internal/normalized_event.hpp"
 
 namespace trading::shards {
 
@@ -21,7 +21,7 @@ struct BookState {
 
 class BookStore {
   public:
-    [[nodiscard]] bool apply(const DecodedMessage& message);
+    [[nodiscard]] bool apply(const internal::NormalizedEvent& event);
     [[nodiscard]] const BookState* find(std::string_view market_ticker) const;
     [[nodiscard]] std::size_t size() const;
 

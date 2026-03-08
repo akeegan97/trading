@@ -53,8 +53,7 @@ ShardedEventDispatch::ShardedEventDispatch(ShardedEventDispatchConfig config) {
     }
 }
 
-bool ShardedEventDispatch::dispatch(const RouteKey& route_key,
-                                    const model::NormalizedEvent& event) {
+bool ShardedEventDispatch::dispatch(const RouteKey& route_key, const RoutedFrame& frame) {
     if (route_key.shard_id >= shard_queues_.size()) {
         dropped_count_.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -62,7 +61,7 @@ bool ShardedEventDispatch::dispatch(const RouteKey& route_key,
 
     RoutedEvent routed{
         .route_key = route_key,
-        .event = event,
+        .frame = frame,
     };
     if (!shard_queues_[route_key.shard_id]->try_push(routed)) {
         dropped_count_.fetch_add(1, std::memory_order_relaxed);
@@ -84,10 +83,9 @@ std::size_t ShardedEventDispatch::dropped_count() const {
     return dropped_count_.load(std::memory_order_relaxed);
 }
 
-bool NoopShardDispatch::dispatch(const RouteKey& route_key,
-                                 const model::NormalizedEvent& event) {
+bool NoopShardDispatch::dispatch(const RouteKey& route_key, const RoutedFrame& frame) {
     (void)route_key;
-    (void)event;
+    (void)frame;
     dispatched_count_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }

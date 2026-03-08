@@ -2,28 +2,35 @@
 
 namespace trading::shards {
 
-bool BookStore::apply(const DecodedMessage& message) {
-    if (message.market_ticker.empty() || message.type == DecodedMessageType::kUnknown) {
+bool BookStore::apply(const internal::NormalizedEvent& event) {
+    if (event.market_ticker.empty() || event.type == internal::EventType::kUnknown) {
         return false;
     }
 
-    auto [it, inserted] = books_.try_emplace(message.market_ticker);
+    auto [it, inserted] = books_.try_emplace(event.market_ticker);
     if (inserted) {
-        it->second.market_ticker = message.market_ticker;
+        it->second.market_ticker = event.market_ticker;
     }
 
-    it->second.last_seq_id = message.seq_id;
-    switch (message.type) {
-    case DecodedMessageType::kSnapshot:
+    if (event.raw_sequence_id.has_value()) {
+        it->second.last_seq_id = event.raw_sequence_id;
+    } else if (event.meta.sequence_id != 0U) {
+        it->second.last_seq_id = event.meta.sequence_id;
+    }
+
+    switch (event.type) {
+    case internal::EventType::kSnapshot:
         ++it->second.snapshot_count;
         break;
-    case DecodedMessageType::kDelta:
+    case internal::EventType::kDelta:
         ++it->second.delta_count;
         break;
-    case DecodedMessageType::kTrade:
+    case internal::EventType::kTrade:
         ++it->second.trade_count;
         break;
-    case DecodedMessageType::kUnknown:
+    case internal::EventType::kHeartbeat:
+    case internal::EventType::kStatus:
+    case internal::EventType::kUnknown:
         return false;
     }
     return true;
