@@ -411,6 +411,207 @@ TEST(BookStoreTest, DeltaUpdatesAndRemovesLevels) {
     EXPECT_EQ(state->last_seq_id.value_or(0U), 4U);
 }
 
+TEST(BookStoreMatrixTest, RejectsTopLevelContractViolations) {
+    constexpr trading::internal::PriceTicks kBidPrice = 100;
+    constexpr trading::internal::PriceTicks kAskPrice = 101;
+    trading::shards::BookStore books;
+
+    trading::internal::NormalizedEvent empty_ticker{};
+    empty_ticker.type = trading::internal::EventType::kSnapshot;
+    empty_ticker.data = trading::internal::SnapshotData{
+        .bids = std::vector<trading::internal::Level>{{kBidPrice, 1}},
+        .asks = std::vector<trading::internal::Level>{{kAskPrice, 1}}};
+    EXPECT_FALSE(books.apply(empty_ticker));
+
+    trading::internal::NormalizedEvent unknown_type{};
+    unknown_type.type = trading::internal::EventType::kUnknown;
+    unknown_type.market_ticker = "KXBTC-YES";
+    unknown_type.data = trading::internal::SnapshotData{
+        .bids = std::vector<trading::internal::Level>{{kBidPrice, 1}},
+        .asks = std::vector<trading::internal::Level>{{kAskPrice, 1}},
+    };
+    EXPECT_FALSE(books.apply(unknown_type));
+
+    EXPECT_EQ(books.size(), 0U);
+}
+
+TEST(BookStoreMatrixTest, RejectsInvalidSnapshotAndDeltaPayloads) {
+    constexpr std::string_view kTicker = "KXBTC-YES";
+    constexpr trading::internal::PriceTicks kBidPrice = 100;
+    constexpr trading::internal::PriceTicks kAskPrice = 101;
+    constexpr trading::internal::PriceTicks kNegativePrice = -5;
+    constexpr trading::internal::SequenceId kBaseSnapshotSeq = 1U;
+    constexpr trading::internal::SequenceId kInvalidSnapshotSeqA = 2U;
+    constexpr trading::internal::SequenceId kInvalidSnapshotSeqB = 3U;
+    constexpr trading::internal::SequenceId kInvalidDeltaSeqA = 4U;
+    constexpr trading::internal::SequenceId kInvalidDeltaSeqB = 5U;
+    constexpr trading::internal::SequenceId kInvalidTradeSeq = 6U;
+
+    struct InvalidCase {
+        std::string name;
+        trading::internal::NormalizedEvent event;
+    };
+
+    const std::vector<InvalidCase> cases = {
+        {
+            .name = "snapshot_negative_price",
+            .event = make_snapshot_event(std::string{kTicker}, kInvalidSnapshotSeqA, {{-1, 2}},
+                                         {{kAskPrice, 1}}),
+        },
+        {
+            .name = "snapshot_non_positive_qty",
+            .event = make_snapshot_event(std::string{kTicker}, kInvalidSnapshotSeqB,
+                                         {{kBidPrice, 0}}, {{kAskPrice, 1}}),
+        },
+        {
+            .name = "delta_unknown_side",
+            .event = make_delta_event(std::string{kTicker}, kInvalidDeltaSeqA,
+                                      trading::internal::Side::kUnknown, kBidPrice, 1),
+        },
+        {
+            .name = "delta_negative_price",
+            .event = make_delta_event(std::string{kTicker}, kInvalidDeltaSeqB,
+                                      trading::internal::Side::kBid, kNegativePrice, 1),
+        },
+        {
+            .name = "trade_variant_mismatch",
+            .event =
+                [kTicker, kBidPrice, kInvalidTradeSeq] {
+                    auto malformed =
+                        make_trade_event(std::string{kTicker}, kInvalidTradeSeq, kBidPrice, 1);
+                    malformed.data = trading::internal::SnapshotData{};
+                    return malformed;
+                }(),
+        },
+    };
+
+    for (const auto& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        trading::shards::BookStore books;
+        ASSERT_TRUE(books.apply(make_snapshot_event(std::string{kTicker}, kBaseSnapshotSeq,
+                                                    {{kBidPrice, 2}}, {{kAskPrice, 2}})));
+
+        EXPECT_FALSE(books.apply(test_case.event));
+        const auto* state = books.find(kTicker);
+        ASSERT_NE(state, nullptr);
+        EXPECT_EQ(state->apply_reject_count, 1U);
+    }
+}
+
+TEST(BookStoreMatrixTest, UsesMetaSequenceWhenRawSequenceMissing) {
+    constexpr trading::internal::PriceTicks kBidPrice = 100;
+    constexpr trading::internal::PriceTicks kAskPrice = 101;
+    constexpr trading::internal::SequenceId kMetaOnlySeq = 41U;
+    trading::shards::BookStore books;
+    auto snapshot =
+        make_snapshot_event("KXBTC-YES", std::nullopt, {{kBidPrice, 1}}, {{kAskPrice, 1}});
+    snapshot.meta.sequence_id = kMetaOnlySeq;
+
+    ASSERT_TRUE(books.apply(snapshot));
+    const auto* state = books.find("KXBTC-YES");
+    ASSERT_NE(state, nullptr);
+    ASSERT_TRUE(state->last_seq_id.has_value());
+    EXPECT_EQ(state->last_seq_id.value_or(0U), kMetaOnlySeq);
+}
+
+TEST(BookStoreMatrixTest, RawSequenceTakesPrecedenceOverMetaSequence) {
+    constexpr trading::internal::PriceTicks kBidPrice = 100;
+    constexpr trading::internal::PriceTicks kAskPrice = 101;
+    constexpr trading::internal::SequenceId kRawSeq = 10U;
+    constexpr trading::internal::SequenceId kConflictingMetaSeq = 999U;
+    trading::shards::BookStore books;
+    auto snapshot = make_snapshot_event("KXBTC-YES", kRawSeq, {{kBidPrice, 1}}, {{kAskPrice, 1}});
+    snapshot.meta.sequence_id = kConflictingMetaSeq;
+
+    ASSERT_TRUE(books.apply(snapshot));
+    const auto* state = books.find("KXBTC-YES");
+    ASSERT_NE(state, nullptr);
+    ASSERT_TRUE(state->last_seq_id.has_value());
+    EXPECT_EQ(state->last_seq_id.value_or(0U), kRawSeq);
+}
+
+TEST(BookStoreMatrixTest, DeltaBeforeSnapshotBuffersThenReplaysAfterSnapshot) {
+    constexpr std::string_view kTicker = "KXBTC-YES";
+    constexpr trading::internal::PriceTicks kBidPrice = 100;
+    constexpr trading::internal::PriceTicks kAskPrice = 101;
+    constexpr trading::internal::SequenceId kBufferedDeltaSeq = 2U;
+    constexpr trading::internal::SequenceId kSnapshotSeq = 1U;
+    trading::shards::BookStore books;
+
+    ASSERT_TRUE(books.apply(make_delta_event(std::string{kTicker}, kBufferedDeltaSeq,
+                                             trading::internal::Side::kBid, kBidPrice, 5)));
+    const auto* pre_snapshot = books.find(kTicker);
+    ASSERT_NE(pre_snapshot, nullptr);
+    EXPECT_FALSE(pre_snapshot->has_snapshot);
+    EXPECT_FALSE(pre_snapshot->desynced);
+    EXPECT_EQ(pre_snapshot->delta_count, 0U);
+    EXPECT_EQ(pre_snapshot->buffered_delta_count, 1U);
+    EXPECT_EQ(pre_snapshot->pending_deltas.size(), 1U);
+    EXPECT_EQ(pre_snapshot->bids.count(kBidPrice), 0U);
+
+    ASSERT_TRUE(books.apply(make_snapshot_event(std::string{kTicker}, kSnapshotSeq,
+                                                {{kBidPrice, 3}}, {{kAskPrice, 2}})));
+
+    const auto* state = books.find(kTicker);
+    ASSERT_NE(state, nullptr);
+    EXPECT_TRUE(state->has_snapshot);
+    EXPECT_FALSE(state->desynced);
+    EXPECT_EQ(state->snapshot_count, 1U);
+    EXPECT_EQ(state->delta_count, 1U);
+    EXPECT_EQ(state->replayed_delta_count, 1U);
+    EXPECT_EQ(state->pending_deltas.size(), 0U);
+    ASSERT_EQ(state->bids.count(kBidPrice), 1U);
+    EXPECT_EQ(state->bids.at(kBidPrice), 8);
+}
+
+// NOLINTBEGIN(readability-function-cognitive-complexity)
+TEST(BookStoreMatrixTest, PendingDeltaOverflowMarksDesyncUntilSnapshot) {
+    constexpr std::string_view kTicker = "KXBTC-YES";
+    constexpr trading::internal::PriceTicks kBidPrice = 100;
+    constexpr trading::internal::PriceTicks kAskPrice = 101;
+    constexpr trading::internal::SequenceId kPostDesyncDeltaSeq = 9999U;
+    constexpr trading::internal::SequenceId kPostDesyncTradeSeq = 10000U;
+    constexpr trading::internal::SequenceId kRecoverySnapshotSeq = 10001U;
+    trading::shards::BookStore books;
+
+    for (std::size_t i = 0; i < trading::shards::BookStore::kMaxPendingDeltas; ++i) {
+        ASSERT_TRUE(books.apply(make_delta_event(std::string{kTicker},
+                                                 static_cast<trading::internal::SequenceId>(i + 1U),
+                                                 trading::internal::Side::kBid, kBidPrice, 1)));
+    }
+    EXPECT_FALSE(
+        books.apply(make_delta_event(std::string{kTicker},
+                                     static_cast<trading::internal::SequenceId>(
+                                         trading::shards::BookStore::kMaxPendingDeltas + 1U),
+                                     trading::internal::Side::kBid, kBidPrice, 1)));
+
+    const auto* desynced = books.find(kTicker);
+    ASSERT_NE(desynced, nullptr);
+    EXPECT_TRUE(desynced->desynced);
+    EXPECT_FALSE(desynced->has_snapshot);
+    EXPECT_EQ(desynced->pending_deltas.size(), 0U);
+    EXPECT_EQ(desynced->desync_count, 1U);
+    EXPECT_EQ(desynced->dropped_pending_delta_count,
+              trading::shards::BookStore::kMaxPendingDeltas + 1U);
+
+    EXPECT_FALSE(books.apply(make_delta_event(std::string{kTicker}, kPostDesyncDeltaSeq,
+                                              trading::internal::Side::kBid, kBidPrice, 1)));
+    EXPECT_FALSE(
+        books.apply(make_trade_event(std::string{kTicker}, kPostDesyncTradeSeq, kBidPrice, 1)));
+
+    ASSERT_TRUE(books.apply(make_snapshot_event(std::string{kTicker}, kRecoverySnapshotSeq,
+                                                {{kBidPrice, 3}}, {{kAskPrice, 2}})));
+    const auto* recovered = books.find(kTicker);
+    ASSERT_NE(recovered, nullptr);
+    EXPECT_FALSE(recovered->desynced);
+    EXPECT_TRUE(recovered->has_snapshot);
+    EXPECT_EQ(recovered->snapshot_count, 1U);
+    EXPECT_EQ(recovered->delta_count, 0U);
+    ASSERT_EQ(recovered->bids.count(kBidPrice), 1U);
+    EXPECT_EQ(recovered->bids.at(kBidPrice), 3);
+}
+// NOLINTEND(readability-function-cognitive-complexity)
+
 // NOLINTBEGIN(readability-function-cognitive-complexity)
 TEST(BookStoreTest, SequencePolicyRejectsStaleAndAcceptsNonContiguous) {
     trading::shards::BookStore books;

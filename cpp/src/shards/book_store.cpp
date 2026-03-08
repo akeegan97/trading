@@ -3,8 +3,21 @@
 namespace trading::shards {
 namespace {
 
-bool update_sequence(BookState& book, const internal::NormalizedEvent& event) {
-    const std::optional<internal::SequenceId> sequence_id = event.effective_sequence_id();
+void mark_desynced(BookState& book, std::uint64_t dropped_pending_count = 0) {
+    if (!book.desynced) {
+        ++book.desync_count;
+    }
+    book.desynced = true;
+    book.has_snapshot = false;
+    book.last_seq_id.reset();
+    book.bids.clear();
+    book.asks.clear();
+    book.pending_deltas.clear();
+    book.dropped_pending_delta_count += dropped_pending_count;
+}
+
+bool advance_sequence_if_present(BookState& book,
+                                 const std::optional<internal::SequenceId>& sequence_id) {
     if (!sequence_id.has_value()) {
         return true;
     }
@@ -12,8 +25,8 @@ bool update_sequence(BookState& book, const internal::NormalizedEvent& event) {
     if (book.last_seq_id.has_value()) {
         const auto last_seq = book.last_seq_id.value();
         const auto next_seq = sequence_id.value();
-        // Some feeds use connection-global sequences (e.g. interleaved across markets),
-        // so books should only enforce strictly increasing order, not contiguous increments.
+        // Per-market books allow sequence gaps because some exchanges emit connection-global
+        // sequence ids, but regressions/stale values are rejected.
         if (next_seq <= last_seq) {
             ++book.stale_sequence_count;
             return false;
@@ -81,6 +94,27 @@ bool apply_delta_data(BookState& book, const internal::DeltaData& delta) {
     return false;
 }
 
+bool replay_pending_deltas(BookState& book) {
+    while (!book.pending_deltas.empty()) {
+        BookState::PendingDelta pending = book.pending_deltas.front();
+        book.pending_deltas.pop_front();
+
+        if (!advance_sequence_if_present(book, pending.sequence_id)) {
+            ++book.dropped_pending_delta_count;
+            continue;
+        }
+        if (!apply_delta_data(book, pending.delta)) {
+            const auto remaining = static_cast<std::uint64_t>(book.pending_deltas.size());
+            mark_desynced(book, remaining + 1U);
+            return false;
+        }
+
+        ++book.delta_count;
+        ++book.replayed_delta_count;
+    }
+    return true;
+}
+
 } // namespace
 
 bool BookStore::apply(const internal::NormalizedEvent& event) {
@@ -92,44 +126,76 @@ bool BookStore::apply(const internal::NormalizedEvent& event) {
     if (inserted) {
         it->second.market_ticker = event.market_ticker;
     }
-    if (!update_sequence(it->second, event)) {
-        ++it->second.apply_reject_count;
-        return false;
-    }
+    BookState& book = it->second;
 
     switch (event.type) {
     case internal::EventType::kSnapshot: {
         const auto* snapshot = std::get_if<internal::SnapshotData>(&event.data);
-        if (snapshot == nullptr || !apply_snapshot_data(it->second, *snapshot)) {
-            ++it->second.apply_reject_count;
+        if (snapshot == nullptr || !apply_snapshot_data(book, *snapshot)) {
+            ++book.apply_reject_count;
             return false;
         }
-        ++it->second.snapshot_count;
+        book.has_snapshot = true;
+        book.desynced = false;
+        book.last_seq_id = event.effective_sequence_id();
+        ++book.snapshot_count;
+        if (!replay_pending_deltas(book)) {
+            ++book.apply_reject_count;
+            return false;
+        }
         break;
     }
     case internal::EventType::kDelta: {
         const auto* delta = std::get_if<internal::DeltaData>(&event.data);
-        if (delta == nullptr || !apply_delta_data(it->second, *delta)) {
-            ++it->second.apply_reject_count;
+        if (delta == nullptr) {
+            ++book.apply_reject_count;
             return false;
         }
-        ++it->second.delta_count;
+
+        if (book.desynced) {
+            ++book.apply_reject_count;
+            return false;
+        }
+        if (!book.has_snapshot) {
+            if (book.pending_deltas.size() >= BookStore::kMaxPendingDeltas) {
+                const std::uint64_t dropped_pending =
+                    static_cast<std::uint64_t>(book.pending_deltas.size()) + 1U;
+                mark_desynced(book, dropped_pending);
+                ++book.apply_reject_count;
+                return false;
+            }
+
+            book.pending_deltas.push_back(BookState::PendingDelta{
+                .sequence_id = event.effective_sequence_id(),
+                .delta = *delta,
+            });
+            ++book.buffered_delta_count;
+            return true;
+        }
+        if (!advance_sequence_if_present(book, event.effective_sequence_id()) ||
+            !apply_delta_data(book, *delta)) {
+            ++book.apply_reject_count;
+            return false;
+        }
+
+        ++book.delta_count;
         break;
     }
     case internal::EventType::kTrade: {
         const auto* trade = std::get_if<internal::TradeData>(&event.data);
-        if (trade == nullptr) {
-            ++it->second.apply_reject_count;
+        if (trade == nullptr || book.desynced ||
+            !advance_sequence_if_present(book, event.effective_sequence_id())) {
+            ++book.apply_reject_count;
             return false;
         }
-        it->second.last_trade = *trade;
-        ++it->second.trade_count;
+        book.last_trade = *trade;
+        ++book.trade_count;
         break;
     }
     case internal::EventType::kHeartbeat:
     case internal::EventType::kStatus:
     case internal::EventType::kUnknown:
-        ++it->second.apply_reject_count;
+        ++book.apply_reject_count;
         return false;
     }
     return true;
