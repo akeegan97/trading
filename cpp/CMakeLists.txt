@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(spdlog CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(simdjson CONFIG REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system)
 find_package(OpenSSL REQUIRED)
 find_package(GTest CONFIG REQUIRED)
@@ -42,6 +43,28 @@ target_link_libraries(
          OpenSSL::Crypto
 )
 
+add_library(
+  trading_pipeline
+  src/ingest/frame_pool.cpp
+  src/ingest/ws_message_sink.cpp
+  src/decode/dispatch.cpp
+  src/decode/exchanges/kalshi/extractor.cpp
+  src/decode/exchanges/polymarket/extractor.cpp
+  src/router/router.cpp
+  src/router/shard_dispatch.cpp
+  src/shards/book_store.cpp
+  src/shards/message_parser.cpp
+  src/shards/shard.cpp
+  src/parsers/exchanges/kalshi/parser.cpp
+  src/parsers/exchanges/polymarket/parser.cpp
+)
+target_include_directories(trading_pipeline PUBLIC include)
+target_link_libraries(
+  trading_pipeline
+  PUBLIC trading_adapters_ws
+         simdjson::simdjson
+)
+
 add_executable(trader_app apps/trader/main.cpp)
 target_link_libraries(
   trader_app
@@ -65,6 +88,7 @@ if(BUILD_TESTING)
     PRIVATE trading_core
             trading_engine
             trading_adapters_ws
+            trading_pipeline
             GTest::gtest_main
   )
   gtest_discover_tests(trading_tests)
