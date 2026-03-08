@@ -6,6 +6,9 @@ Checks should run in both places:
 - Locally before pushing (fast feedback)
 - In GitHub Actions on every PR (merge gate and audit trail)
 
+Performance optimization ideas tracked here:
+- [`docs/perf_backlog.md`](docs/perf_backlog.md)
+
 ## Workflow
 
 1. Create a branch from `main`:

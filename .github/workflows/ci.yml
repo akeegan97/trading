@@ -33,18 +33,29 @@ jobs:
   cxx-format:
     name: C++ clang-format
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('cpp/**/*.c', 'cpp/**/*.cc', 'cpp/**/*.cpp', 'cpp/**/*.cxx', 'cpp/**/*.h', 'cpp/**/*.hh', 'cpp/**/*.hpp', 'cpp/**/*.hxx') != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Detect C/C++ files
+        id: detect_cpp
+        run: |
+          set -euo pipefail
+          if find cpp -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o -name '*.h' -o -name '*.hh' -o -name '*.hpp' -o -name '*.hxx' \) ! -path 'cpp/third_party/*' ! -path 'cpp/vendor/*' | grep -q .; then
+            echo "has_cpp=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cpp=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install clang-format
+        if: ${{ steps.detect_cpp.outputs.has_cpp == 'true' }}
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y clang-format
 
       - name: Check formatting
+        if: ${{ steps.detect_cpp.outputs.has_cpp == 'true' }}
         run: |
           set -euo pipefail
           mapfile -t cpp_files < <(find cpp -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o -name '*.h' -o -name '*.hh' -o -name '*.hpp' -o -name '*.hxx' \) ! -path 'cpp/third_party/*' ! -path 'cpp/vendor/*')
@@ -54,31 +65,52 @@ jobs:
           fi
           clang-format --dry-run --Werror "${cpp_files[@]}"
 
+      - name: Skip clang-format (no C/C++ files)
+        if: ${{ steps.detect_cpp.outputs.has_cpp != 'true' }}
+        run: echo "No C/C++ files found. Skipping clang-format."
+
   cxx-build-and-tidy:
     name: C++ CMake build + clang-tidy + tests
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('cpp/CMakeLists.txt') != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Detect CMake and vcpkg config
+        id: detect_cmake
+        run: |
+          set -euo pipefail
+          if [ -f cpp/CMakeLists.txt ]; then
+            echo "has_cmake=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cmake=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f cpp/vcpkg.json ]; then
+            echo "has_vcpkg=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_vcpkg=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install C++ toolchain
+        if: ${{ steps.detect_cmake.outputs.has_cmake == 'true' }}
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build clang clang-tidy
 
       - name: Cache vcpkg artifacts
-        if: ${{ hashFiles('cpp/vcpkg.json') != '' }}
+        if: ${{ steps.detect_cmake.outputs.has_cmake == 'true' && steps.detect_cmake.outputs.has_vcpkg == 'true' }}
         uses: actions/cache@v4
         with:
           path: |
             ${{ runner.temp }}/vcpkg/downloads
             ${{ github.workspace }}/.vcpkg_installed
-          key: ${{ runner.os }}-vcpkg-${{ hashFiles('cpp/vcpkg.json') }}
+          key: ${{ runner.os }}-vcpkg-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-
 
       - name: Setup vcpkg
-        if: ${{ hashFiles('cpp/vcpkg.json') != '' }}
+        if: ${{ steps.detect_cmake.outputs.has_cmake == 'true' && steps.detect_cmake.outputs.has_vcpkg == 'true' }}
         run: |
           set -euo pipefail
           git clone --depth 1 https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"
@@ -86,6 +118,7 @@ jobs:
           echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
 
       - name: Configure (CMake)
+        if: ${{ steps.detect_cmake.outputs.has_cmake == 'true' }}
         run: |
           set -euo pipefail
           if [ -f CMakePresets.json ]; then
@@ -99,6 +132,7 @@ jobs:
           fi
 
       - name: Build
+        if: ${{ steps.detect_cmake.outputs.has_cmake == 'true' }}
         run: |
           set -euo pipefail
           if [ -f CMakePresets.json ]; then
@@ -112,6 +146,7 @@ jobs:
           fi
 
       - name: clang-tidy
+        if: ${{ steps.detect_cmake.outputs.has_cmake == 'true' }}
         run: |
           set -euo pipefail
           mapfile -t cpp_files < <(find cpp -type f \( -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \) ! -path 'cpp/third_party/*' ! -path 'cpp/vendor/*')
@@ -122,6 +157,7 @@ jobs:
           clang-tidy -p build/ci --warnings-as-errors='*' "${cpp_files[@]}"
 
       - name: Test (ctest)
+        if: ${{ steps.detect_cmake.outputs.has_cmake == 'true' }}
         run: |
           set -euo pipefail
           if [ -f CMakePresets.json ]; then
@@ -134,21 +170,36 @@ jobs:
             ctest --test-dir build/ci --output-on-failure
           fi
 
+      - name: Skip C++ build/tidy/tests (no CMake project)
+        if: ${{ steps.detect_cmake.outputs.has_cmake != 'true' }}
+        run: echo "cpp/CMakeLists.txt not found. Skipping C++ build/tidy/tests."
+
   python:
     name: Python ruff + pytest
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('pyproject.toml') != '' || hashFiles('requirements.txt') != '' || hashFiles('requirements-dev.txt') != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Detect Python project files
+        id: detect_python
+        run: |
+          set -euo pipefail
+          if [ -f pyproject.toml ] || [ -f requirements.txt ] || [ -f requirements-dev.txt ]; then
+            echo "has_python=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_python=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup Python
+        if: ${{ steps.detect_python.outputs.has_python == 'true' }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
+        if: ${{ steps.detect_python.outputs.has_python == 'true' }}
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
@@ -161,11 +212,13 @@ jobs:
           pip install ruff pytest
 
       - name: Lint (ruff)
+        if: ${{ steps.detect_python.outputs.has_python == 'true' }}
         run: |
           set -euo pipefail
           ruff check .
 
       - name: Test (pytest)
+        if: ${{ steps.detect_python.outputs.has_python == 'true' }}
         run: |
           set -euo pipefail
           if [ -d tests ] || compgen -G "*_test.py" > /dev/null || compgen -G "test_*.py" > /dev/null; then
@@ -173,3 +226,7 @@ jobs:
           else
             echo "No Python tests found."
           fi
+
+      - name: Skip Python checks (no Python project files)
+        if: ${{ steps.detect_python.outputs.has_python != 'true' }}
+        run: echo "No Python project files found. Skipping Python checks."
