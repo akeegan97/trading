@@ -9,6 +9,12 @@ Checks should run in both places:
 Performance optimization ideas tracked here:
 - [`docs/perf_backlog.md`](docs/perf_backlog.md)
 
+Pipeline handoff contract is documented here:
+- [`docs/data_contract.md`](docs/data_contract.md)
+
+Trader runtime config drop-file example:
+- [`docs/trader_config.example.json`](docs/trader_config.example.json)
+
 ## Workflow
 
 1. Create a branch from `main`:
@@ -79,4 +85,14 @@ git add .
 git commit -m "chore: bootstrap repo standards"
 git remote add origin <your-github-repo-url>
 git push -u origin main
+```
+
+## Running Trader App With Drop File
+
+```bash
+# pass file path directly
+./build/dev/cpp/trader_app docs/trader_config.example.json
+
+# or by env var
+TRADING_CONFIG_PATH=docs/trader_config.example.json ./build/dev/cpp/trader_app
 ```

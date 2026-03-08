@@ -1,14 +1,17 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <optional>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "support/fake_ws_transport.hpp"
 #include "trading/adapters/exchanges/kalshi/auth_signer.hpp"
 #include "trading/adapters/exchanges/kalshi/ws_adapter.hpp"
 #include "trading/adapters/ws/session.hpp"
+#include "trading/config/trader_config.hpp"
 #include "trading/decode/exchanges/kalshi/extractor.hpp"
 #include "trading/decode/extracted_fields.hpp"
 #include "trading/engine/runtime.hpp"
@@ -16,8 +19,10 @@
 #include "trading/internal/normalized_event.hpp"
 #include "trading/internal/router_frame.hpp"
 #include "trading/parsers/exchanges/kalshi/parser.hpp"
+#include "trading/pipeline/live_pipeline.hpp"
 #include "trading/router/router.hpp"
 #include "trading/router/shard_dispatch.hpp"
+#include "trading/shards/book_store.hpp"
 #include "trading/shards/message_parser.hpp"
 
 namespace {
@@ -153,6 +158,62 @@ const trading::internal::NormalizedEvent& require_parsed(
     return *parsed_value;
 }
 
+trading::internal::NormalizedEvent
+make_snapshot_event(std::string ticker, std::optional<trading::internal::SequenceId> sequence_id,
+                    std::vector<trading::internal::Level> bids,
+                    std::vector<trading::internal::Level> asks) {
+    trading::internal::NormalizedEvent event{};
+    event.type = trading::internal::EventType::kSnapshot;
+    event.market_ticker = std::move(ticker);
+    event.raw_sequence_id = sequence_id;
+    if (sequence_id.has_value()) {
+        event.meta.sequence_id = sequence_id.value();
+    }
+    event.data = trading::internal::SnapshotData{
+        .bids = std::move(bids),
+        .asks = std::move(asks),
+    };
+    return event;
+}
+
+trading::internal::NormalizedEvent
+make_delta_event(std::string ticker, std::optional<trading::internal::SequenceId> sequence_id,
+                 trading::internal::Side side, trading::internal::PriceTicks price_ticks,
+                 trading::internal::QtyLots delta_qty_lots) {
+    trading::internal::NormalizedEvent event{};
+    event.type = trading::internal::EventType::kDelta;
+    event.market_ticker = std::move(ticker);
+    event.raw_sequence_id = sequence_id;
+    if (sequence_id.has_value()) {
+        event.meta.sequence_id = sequence_id.value();
+    }
+    event.data = trading::internal::DeltaData{
+        .side = side,
+        .price_ticks = price_ticks,
+        .delta_qty_lots = delta_qty_lots,
+    };
+    return event;
+}
+
+trading::internal::NormalizedEvent
+make_trade_event(std::string ticker, std::optional<trading::internal::SequenceId> sequence_id,
+                 trading::internal::PriceTicks price_ticks, trading::internal::QtyLots qty_lots) {
+    trading::internal::NormalizedEvent event{};
+    event.type = trading::internal::EventType::kTrade;
+    event.market_ticker = std::move(ticker);
+    event.raw_sequence_id = sequence_id;
+    if (sequence_id.has_value()) {
+        event.meta.sequence_id = sequence_id.value();
+    }
+    event.data = trading::internal::TradeData{
+        .price_ticks = price_ticks,
+        .qty_lots = qty_lots,
+        .aggressor = trading::internal::Side::kBuy,
+        .trade_id = std::optional<std::string>{"trade-1"},
+    };
+    return event;
+}
+
 TEST(TradingCoreTest, StartupPayloadHasExpectedFields) {
     const auto startup = trading::engine::build_trader_startup_payload("test");
     const auto startup_json = nlohmann::json::parse(startup);
@@ -160,6 +221,61 @@ TEST(TradingCoreTest, StartupPayloadHasExpectedFields) {
     EXPECT_EQ(startup_json.at("service"), "trading_engine");
     EXPECT_EQ(startup_json.at("status"), "ok");
     EXPECT_EQ(startup_json.at("mode"), "test");
+}
+
+TEST(TraderConfigTest, ParsesDropFileOverrides) {
+    constexpr std::string_view kConfig = R"({
+        "mode": "paper",
+        "kalshi": {
+            "endpoint": "wss://api.elections.kalshi.com/trade-api/ws/v2",
+            "channels": ["orderbook_delta", "trade"],
+            "credentials": {
+                "key_id_env": "MY_KEY_ENV",
+                "private_key_pem_env": "MY_PEM_ENV"
+            }
+        },
+        "pipeline": {
+            "source": "kalshi-live",
+            "exchange": "kalshi",
+            "frame_pool_capacity": 2048,
+            "frame_queue_capacity": 2048,
+            "shard_count": 8,
+            "per_shard_queue_capacity": 512,
+            "shard_idle_sleep_ms": 0
+        },
+        "runtime": {
+            "pump_batch_size": 256,
+            "pump_idle_sleep_ms": 2
+        }
+    })";
+
+    const auto loaded = trading::config::load_trader_config_from_json(kConfig);
+    ASSERT_TRUE(loaded.ok) << loaded.error;
+
+    EXPECT_EQ(loaded.config.mode, "paper");
+    EXPECT_EQ(loaded.config.kalshi.channels.size(), 2U);
+    EXPECT_EQ(loaded.config.kalshi.channels[0], "orderbook_delta");
+    EXPECT_EQ(loaded.config.kalshi.credentials.key_id_env, "MY_KEY_ENV");
+    EXPECT_EQ(loaded.config.kalshi.credentials.private_key_pem_env, "MY_PEM_ENV");
+    EXPECT_EQ(loaded.config.pipeline.source, "kalshi-live");
+    EXPECT_EQ(loaded.config.pipeline.decode_exchange, trading::decode::ExchangeId::kKalshi);
+    EXPECT_EQ(loaded.config.pipeline.router_exchange, trading::internal::ExchangeId::kKalshi);
+    EXPECT_EQ(loaded.config.pipeline.frame_pool_capacity, 2048U);
+    EXPECT_EQ(loaded.config.pipeline.shard_count, 8U);
+    EXPECT_EQ(loaded.config.pump_batch_size, 256U);
+    EXPECT_EQ(loaded.config.pump_idle_sleep, std::chrono::milliseconds{2});
+}
+
+TEST(TraderConfigTest, RejectsUnknownExchange) {
+    constexpr std::string_view kConfig = R"({
+        "pipeline": {
+            "exchange": "unknown-x"
+        }
+    })";
+
+    const auto loaded = trading::config::load_trader_config_from_json(kConfig);
+    EXPECT_FALSE(loaded.ok);
+    EXPECT_NE(loaded.error.find("pipeline.exchange"), std::string::npos);
 }
 
 TEST(WsSessionTest, ConnectBuildsKalshiHeaders) {
@@ -253,6 +369,70 @@ TEST(RouterTest, RoutesSameMarketToSameShard) {
     EXPECT_EQ(shard_dispatch.dropped_count(), 0U);
 }
 
+TEST(BookStoreTest, SnapshotBuildsBidAskState) {
+    trading::shards::BookStore books;
+    const auto snapshot_event =
+        make_snapshot_event("KXBTC-YES", 10U, {{100, 5}, {99, 2}}, {{101, 3}, {102, 1}});
+
+    ASSERT_TRUE(books.apply(snapshot_event));
+    const auto* state = books.find("KXBTC-YES");
+    ASSERT_NE(state, nullptr);
+    EXPECT_EQ(state->snapshot_count, 1U);
+    EXPECT_EQ(state->delta_count, 0U);
+    EXPECT_EQ(state->trade_count, 0U);
+    ASSERT_TRUE(state->last_seq_id.has_value());
+    EXPECT_EQ(state->last_seq_id.value_or(0U), 10U);
+    ASSERT_EQ(state->bids.size(), 2U);
+    ASSERT_EQ(state->asks.size(), 2U);
+    EXPECT_EQ(state->bids.begin()->first, 100);
+    EXPECT_EQ(state->bids.begin()->second, 5);
+    EXPECT_EQ(state->asks.begin()->first, 101);
+    EXPECT_EQ(state->asks.begin()->second, 3);
+}
+
+TEST(BookStoreTest, DeltaUpdatesAndRemovesLevels) {
+    trading::shards::BookStore books;
+    ASSERT_TRUE(books.apply(make_snapshot_event("KXBTC-YES", 1U, {{100, 5}}, {{101, 3}})));
+
+    ASSERT_TRUE(
+        books.apply(make_delta_event("KXBTC-YES", 2U, trading::internal::Side::kBid, 100, -2)));
+    ASSERT_TRUE(
+        books.apply(make_delta_event("KXBTC-YES", 3U, trading::internal::Side::kBid, 100, -3)));
+    ASSERT_TRUE(
+        books.apply(make_delta_event("KXBTC-YES", 4U, trading::internal::Side::kAsk, 102, 4)));
+
+    const auto* state = books.find("KXBTC-YES");
+    ASSERT_NE(state, nullptr);
+    EXPECT_EQ(state->delta_count, 3U);
+    EXPECT_EQ(state->bids.count(100), 0U);
+    ASSERT_EQ(state->asks.count(102), 1U);
+    EXPECT_EQ(state->asks.at(102), 4);
+    ASSERT_TRUE(state->last_seq_id.has_value());
+    EXPECT_EQ(state->last_seq_id.value_or(0U), 4U);
+}
+
+// NOLINTBEGIN(readability-function-cognitive-complexity)
+TEST(BookStoreTest, SequencePolicyRejectsStaleAndAcceptsNonContiguous) {
+    trading::shards::BookStore books;
+    ASSERT_TRUE(books.apply(make_snapshot_event("KXBTC-YES", 5U, {{100, 5}}, {{101, 5}})));
+
+    EXPECT_FALSE(
+        books.apply(make_delta_event("KXBTC-YES", 4U, trading::internal::Side::kBid, 100, 1)));
+    ASSERT_TRUE(books.apply(make_trade_event("KXBTC-YES", 8U, 100, 2)));
+
+    const auto* state = books.find("KXBTC-YES");
+    ASSERT_NE(state, nullptr);
+    EXPECT_EQ(state->stale_sequence_count, 1U);
+    EXPECT_EQ(state->trade_count, 1U);
+    ASSERT_TRUE(state->last_trade.has_value());
+    if (state->last_trade.has_value()) {
+        EXPECT_EQ(state->last_trade.value().price_ticks, 100);
+    }
+    ASSERT_TRUE(state->last_seq_id.has_value());
+    EXPECT_EQ(state->last_seq_id.value_or(0U), 8U);
+}
+// NOLINTEND(readability-function-cognitive-complexity)
+
 TEST(RoutedEventParserTest, ParsesKalshiSnapshotFromRoutedEvent) {
     const auto routed_event = make_routed_event(
         R"({
@@ -307,6 +487,67 @@ TEST(KalshiDecodeExtractorTest, ExtractsTickerAndSequenceFromSnapshotPayload) {
     ASSERT_TRUE(extracted.seq_id.has_value());
     EXPECT_EQ(extracted.seq_id.value_or(0U), 2U);
 }
+
+// NOLINTBEGIN(readability-function-cognitive-complexity)
+TEST(LivePipelineTest, RoutesMessageFromSinkThroughRouterIntoShardBooks) {
+    constexpr std::string_view kTicker = "FED-23DEC-T3.00";
+    constexpr std::string_view kPayload = R"({
+        "type": "orderbook_snapshot",
+        "sid": 3,
+        "seq": 2,
+        "msg": {
+            "market_ticker": "FED-23DEC-T3.00",
+            "yes": [[95, 54], [94, 1]],
+            "no": [[7, 87], [6, 32]]
+        }
+    })";
+    constexpr std::size_t kQueueCapacity = 64;
+    constexpr std::size_t kShardCount = 4;
+    constexpr int kMaxAttempts = 200;
+
+    trading::pipeline::LivePipeline pipeline{
+        trading::pipeline::LivePipelineConfig{
+            .source = "kalshi",
+            .decode_exchange = trading::decode::ExchangeId::kKalshi,
+            .router_exchange = trading::internal::ExchangeId::kKalshi,
+            .frame_pool_capacity = kQueueCapacity,
+            .frame_queue_capacity = kQueueCapacity,
+            .shard_count = kShardCount,
+            .per_shard_queue_capacity = kQueueCapacity,
+            .shard_idle_sleep = std::chrono::milliseconds{1},
+        },
+    };
+    ASSERT_TRUE(pipeline.start());
+
+    auto& sink = pipeline.message_sink();
+    ASSERT_TRUE(sink.push_message(std::string{kPayload}));
+
+    bool found_book = false;
+    for (int attempt = 0; attempt < kMaxAttempts && !found_book; ++attempt) {
+        (void)pipeline.pump_ingest(kQueueCapacity);
+        for (std::size_t shard_id = 0; shard_id < pipeline.shard_count(); ++shard_id) {
+            const auto* books = pipeline.book_store(shard_id);
+            if (books == nullptr) {
+                continue;
+            }
+            if (books->find(kTicker) != nullptr) {
+                found_book = true;
+                break;
+            }
+        }
+        if (!found_book) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+    }
+
+    const auto pipeline_stats = pipeline.stats();
+    pipeline.stop();
+
+    EXPECT_TRUE(found_book);
+    EXPECT_GE(pipeline_stats.ingest_frames_pumped, 1U);
+    EXPECT_GE(pipeline_stats.route_success, 1U);
+}
+// NOLINTEND(readability-function-cognitive-complexity)
 
 TEST(KalshiParserTest, ParsesOrderbookSnapshotDocsExample) {
     constexpr std::string_view kTicker = "FED-23DEC-T3.00";

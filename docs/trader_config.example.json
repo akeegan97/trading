@@ -1,0 +1,27 @@
+{
+  "mode": "paper",
+  "kalshi": {
+    "endpoint": "wss://api.elections.kalshi.com/trade-api/ws/v2",
+    "channels": [
+      "trade",
+      "orderbook_delta"
+    ],
+    "credentials": {
+      "key_id_env": "KALSHI_KEY_ID",
+      "private_key_pem_env": "KALSHI_PRIVATE_KEY_PEM"
+    }
+  },
+  "pipeline": {
+    "source": "kalshi",
+    "exchange": "kalshi",
+    "frame_pool_capacity": 8192,
+    "frame_queue_capacity": 8192,
+    "shard_count": 4,
+    "per_shard_queue_capacity": 1024,
+    "shard_idle_sleep_ms": 1
+  },
+  "runtime": {
+    "pump_batch_size": 1024,
+    "pump_idle_sleep_ms": 1
+  }
+}

@@ -19,6 +19,7 @@ bool Shard::start() {
     parsed_.store(0, std::memory_order_relaxed);
     parse_errors_.store(0, std::memory_order_relaxed);
     applied_.store(0, std::memory_order_relaxed);
+    // Publish started state to readers of running().
     running_.store(true, std::memory_order_release);
 
     worker_ = std::jthread([this](const std::stop_token& stop_token) { run(stop_token); });
@@ -36,6 +37,7 @@ void Shard::stop() {
     running_.store(false, std::memory_order_release);
 }
 
+// Acquire pairs with start/stop release stores.
 bool Shard::running() const { return running_.load(std::memory_order_acquire); }
 
 ShardStats Shard::stats() const {

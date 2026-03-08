@@ -17,22 +17,26 @@ SpscRoutedEventQueue::SpscRoutedEventQueue(std::size_t capacity)
 bool SpscRoutedEventQueue::try_push(const RoutedEvent& event) noexcept {
     const std::size_t head = head_.load(std::memory_order_relaxed);
     const std::size_t next_head = increment(head);
+    // Acquire pairs with consumer tail release for correct full/empty state.
     if (next_head == tail_.load(std::memory_order_acquire)) {
         return false;
     }
 
     buffer_[head] = event;
+    // Publish event payload before publishing updated head.
     head_.store(next_head, std::memory_order_release);
     return true;
 }
 
 bool SpscRoutedEventQueue::try_pop(RoutedEvent& event_out) noexcept {
     const std::size_t tail = tail_.load(std::memory_order_relaxed);
+    // Acquire pairs with producer head release so event fields are visible.
     if (tail == head_.load(std::memory_order_acquire)) {
         return false;
     }
 
     event_out = std::move(buffer_[tail]);
+    // Publish consumed slot after move from buffer_ is complete.
     tail_.store(increment(tail), std::memory_order_release);
     return true;
 }

@@ -49,6 +49,16 @@ struct NormalizedEvent {
     std::optional<SequenceId> raw_sequence_id;
     EventData data;
     std::string raw_payload;
+
+    [[nodiscard]] std::optional<SequenceId> effective_sequence_id() const {
+        if (raw_sequence_id.has_value()) {
+            return raw_sequence_id;
+        }
+        if (meta.sequence_id != 0U) {
+            return meta.sequence_id;
+        }
+        return std::nullopt;
+    }
 };
 
 } // namespace trading::internal
