@@ -1,7 +1,11 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <deque>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <thread>
@@ -9,6 +13,7 @@
 
 #include "support/fake_ws_transport.hpp"
 #include "trading/adapters/exchanges/kalshi/auth_signer.hpp"
+#include "trading/adapters/exchanges/kalshi/oms_adapter.hpp"
 #include "trading/adapters/exchanges/kalshi/ws_adapter.hpp"
 #include "trading/adapters/ws/session.hpp"
 #include "trading/config/trader_config.hpp"
@@ -17,7 +22,9 @@
 #include "trading/engine/runtime.hpp"
 #include "trading/ingest/raw_frame.hpp"
 #include "trading/internal/normalized_event.hpp"
+#include "trading/internal/oms_types.hpp"
 #include "trading/internal/router_frame.hpp"
+#include "trading/oms/order_manager.hpp"
 #include "trading/parsers/exchanges/kalshi/parser.hpp"
 #include "trading/pipeline/live_pipeline.hpp"
 #include "trading/router/router.hpp"
@@ -158,6 +165,17 @@ const trading::internal::NormalizedEvent& require_parsed(
     return *parsed_value;
 }
 
+const trading::internal::OrderStateUpdate& require_order_update(
+    const trading::oms::ParseResult<trading::internal::OrderStateUpdate>& parsed_result) {
+    EXPECT_TRUE(parsed_result.ok()) << " parse_error=" << static_cast<int>(parsed_result.error());
+    static const trading::internal::OrderStateUpdate kEmpty{};
+    const auto& parsed_value = parsed_result.value();
+    if (!parsed_result.ok() || !parsed_value.has_value()) {
+        return kEmpty;
+    }
+    return *parsed_value;
+}
+
 trading::internal::NormalizedEvent
 make_snapshot_event(std::string ticker, std::optional<trading::internal::SequenceId> sequence_id,
                     std::vector<trading::internal::Level> bids,
@@ -213,6 +231,145 @@ make_trade_event(std::string ticker, std::optional<trading::internal::SequenceId
     };
     return event;
 }
+
+template <typename Predicate>
+bool wait_until(Predicate predicate, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return predicate();
+}
+
+class FakeOmsTransport final : public trading::oms::IOrderTransport {
+  public:
+    bool connect(const trading::oms::OrderTransportConfig& config) override {
+        std::scoped_lock lock{mutex_};
+        if (!connect_result_) {
+            last_error_code_.store(ErrorCode::kConnectFailed, std::memory_order_relaxed);
+            return false;
+        }
+        config_ = config;
+        connected_ = true;
+        last_error_code_.store(ErrorCode::kNone, std::memory_order_relaxed);
+        return true;
+    }
+
+    bool send_text(std::string_view payload) override {
+        std::scoped_lock lock{mutex_};
+        if (!connected_) {
+            last_error_code_.store(ErrorCode::kNotConnected, std::memory_order_relaxed);
+            return false;
+        }
+        if (fail_send_) {
+            last_error_code_.store(ErrorCode::kSendFailed, std::memory_order_relaxed);
+            return false;
+        }
+        sent_payloads_.emplace_back(payload);
+        last_error_code_.store(ErrorCode::kNone, std::memory_order_relaxed);
+        return true;
+    }
+
+    std::optional<std::string> recv_text() override {
+        std::scoped_lock lock{mutex_};
+        if (!connected_ || inbound_payloads_.empty()) {
+            return std::nullopt;
+        }
+        std::string payload = std::move(inbound_payloads_.front());
+        inbound_payloads_.pop_front();
+        return payload;
+    }
+
+    void close() override {
+        std::scoped_lock lock{mutex_};
+        connected_ = false;
+    }
+
+    [[nodiscard]] std::string_view last_error() const override {
+        switch (last_error_code_.load(std::memory_order_relaxed)) {
+        case ErrorCode::kNone:
+            return "";
+        case ErrorCode::kConnectFailed:
+            return "connect failed";
+        case ErrorCode::kSendFailed:
+            return "send failed";
+        case ErrorCode::kNotConnected:
+            return "not connected";
+        }
+        return "unknown";
+    }
+
+    void set_connect_result(bool connect_result) {
+        std::scoped_lock lock{mutex_};
+        connect_result_ = connect_result;
+    }
+
+    void set_fail_send(bool fail_send) {
+        std::scoped_lock lock{mutex_};
+        fail_send_ = fail_send;
+    }
+
+    void queue_inbound(std::string payload) {
+        std::scoped_lock lock{mutex_};
+        inbound_payloads_.push_back(std::move(payload));
+    }
+
+    [[nodiscard]] std::vector<std::string> sent_payloads() const {
+        std::scoped_lock lock{mutex_};
+        return sent_payloads_;
+    }
+
+    [[nodiscard]] std::size_t sent_count() const {
+        std::scoped_lock lock{mutex_};
+        return sent_payloads_.size();
+    }
+
+  private:
+    enum class ErrorCode : std::uint8_t {
+        kNone = 0,
+        kConnectFailed,
+        kSendFailed,
+        kNotConnected,
+    };
+
+    mutable std::mutex mutex_;
+    bool connect_result_{true};
+    bool connected_{false};
+    bool fail_send_{false};
+    std::atomic<ErrorCode> last_error_code_{ErrorCode::kNone};
+    trading::oms::OrderTransportConfig config_{};
+    std::deque<std::string> inbound_payloads_;
+    std::vector<std::string> sent_payloads_;
+};
+
+class CollectingOrderEventSink final : public trading::oms::IOrderEventSink {
+  public:
+    bool on_order_update(const trading::internal::OrderStateUpdate& update) override {
+        std::scoped_lock lock{mutex_};
+        updates_.push_back(update);
+        return true;
+    }
+
+    [[nodiscard]] std::size_t update_count() const {
+        std::scoped_lock lock{mutex_};
+        return updates_.size();
+    }
+
+    [[nodiscard]] std::optional<trading::internal::OrderStateUpdate> last_update() const {
+        std::scoped_lock lock{mutex_};
+        if (updates_.empty()) {
+            return std::nullopt;
+        }
+        return updates_.back();
+    }
+
+  private:
+    mutable std::mutex mutex_;
+    std::vector<trading::internal::OrderStateUpdate> updates_;
+};
 
 TEST(TradingCoreTest, StartupPayloadHasExpectedFields) {
     const auto startup = trading::engine::build_trader_startup_payload("test");
@@ -276,6 +433,277 @@ TEST(TraderConfigTest, RejectsUnknownExchange) {
     const auto loaded = trading::config::load_trader_config_from_json(kConfig);
     EXPECT_FALSE(loaded.ok);
     EXPECT_NE(loaded.error.find("pipeline.exchange"), std::string::npos);
+}
+
+TEST(KalshiOmsAdapterTest, BuildsPlaceRequestPayload) {
+    constexpr std::string_view kClientOrderId = "cl-100";
+    constexpr std::string_view kTicker = "KXBTC-YES";
+    constexpr trading::internal::QtyLots kQty = 7;
+    constexpr trading::internal::PriceTicks kPrice = 42;
+
+    const trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    const trading::internal::OrderIntent intent{
+        .exchange = trading::internal::ExchangeId::kKalshi,
+        .action = trading::internal::OmsAction::kPlace,
+        .client_order_id = std::string{kClientOrderId},
+        .market_ticker = std::string{kTicker},
+        .side = trading::internal::Side::kBuy,
+        .qty_lots = kQty,
+        .limit_price_ticks = kPrice,
+        .time_in_force = trading::internal::OmsTimeInForce::kGtc,
+    };
+
+    const auto request_payload = adapter.build_request(intent);
+    const auto request_json = nlohmann::json::parse(request_payload);
+    EXPECT_EQ(request_json.at("action"), "place_order");
+    EXPECT_EQ(request_json.at("client_order_id"), kClientOrderId);
+    EXPECT_EQ(request_json.at("market_ticker"), kTicker);
+    EXPECT_EQ(request_json.at("side"), "buy");
+    EXPECT_EQ(request_json.at("qty"), kQty);
+    EXPECT_EQ(request_json.at("limit_price"), kPrice);
+    EXPECT_EQ(request_json.at("time_in_force"), "gtc");
+}
+
+TEST(KalshiOmsAdapterTest, BuildsCancelRequestPayload) {
+    constexpr std::string_view kClientOrderId = "cancel-1";
+    constexpr std::string_view kTargetClientOrderId = "open-1";
+
+    const trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    const trading::internal::OrderIntent intent{
+        .exchange = trading::internal::ExchangeId::kKalshi,
+        .action = trading::internal::OmsAction::kCancel,
+        .client_order_id = std::string{kClientOrderId},
+        .target_client_order_id = std::string{kTargetClientOrderId},
+    };
+
+    const auto request_payload = adapter.build_request(intent);
+    const auto request_json = nlohmann::json::parse(request_payload);
+    EXPECT_EQ(request_json.at("action"), "cancel_order");
+    EXPECT_EQ(request_json.at("client_order_id"), kClientOrderId);
+    EXPECT_EQ(request_json.at("target_client_order_id"), kTargetClientOrderId);
+}
+
+TEST(KalshiOmsAdapterTest, ParsesAckUpdate) {
+    constexpr std::string_view kAckPayload = R"({
+        "type": "order_ack",
+        "recv_ts_ns": 17,
+        "msg": {
+            "client_order_id": "cl-101",
+            "exchange_order_id": "ex-200",
+            "market_ticker": "KXBTC-YES",
+            "accepted_qty": 5
+        }
+    })";
+
+    const trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    const auto ack = adapter.parse_update(kAckPayload);
+    const auto& ack_update = require_order_update(ack);
+    EXPECT_EQ(ack_update.status, trading::internal::OmsOrderStatus::kAccepted);
+    const auto* ack_data = std::get_if<trading::internal::OrderAck>(&ack_update.data);
+    ASSERT_NE(ack_data, nullptr);
+    EXPECT_EQ(ack_data->accepted_qty_lots, 5);
+}
+
+TEST(KalshiOmsAdapterTest, ParsesRejectUpdate) {
+    constexpr std::string_view kRejectPayload = R"({
+        "type": "order_reject",
+        "recv_ts_ns": 19,
+        "msg": {
+            "client_order_id": "cl-102",
+            "exchange_order_id": "ex-201",
+            "market_ticker": "KXBTC-YES",
+            "reason_code": "invalid_qty",
+            "reason_message": "qty must be positive"
+        }
+    })";
+
+    const trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    const auto reject = adapter.parse_update(kRejectPayload);
+    const auto& reject_update = require_order_update(reject);
+    EXPECT_EQ(reject_update.status, trading::internal::OmsOrderStatus::kRejected);
+    const auto* reject_data = std::get_if<trading::internal::OrderReject>(&reject_update.data);
+    ASSERT_NE(reject_data, nullptr);
+    EXPECT_EQ(reject_data->reason_code, "invalid_qty");
+}
+
+TEST(KalshiOmsAdapterTest, ParsesFillUpdate) {
+    constexpr std::string_view kFillPayload = R"({
+        "type": "fill",
+        "recv_ts_ns": 23,
+        "msg": {
+            "client_order_id": "cl-103",
+            "exchange_order_id": "ex-202",
+            "market_ticker": "KXBTC-YES",
+            "fill_qty": 3,
+            "fill_price": 41
+        }
+    })";
+
+    const trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    const auto fill = adapter.parse_update(kFillPayload);
+    const auto& fill_update = require_order_update(fill);
+    EXPECT_EQ(fill_update.status, trading::internal::OmsOrderStatus::kFilled);
+    const auto* fill_data = std::get_if<trading::internal::OrderFill>(&fill_update.data);
+    ASSERT_NE(fill_data, nullptr);
+    EXPECT_EQ(fill_data->fill_qty_lots, 3);
+    EXPECT_EQ(fill_data->fill_price_ticks, 41);
+}
+
+TEST(KalshiOmsAdapterTest, RejectsUnsupportedUpdateType) {
+    constexpr std::string_view kPayload = R"({
+        "type": "heartbeat",
+        "msg": {}
+    })";
+
+    const trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    const auto parsed = adapter.parse_update(kPayload);
+    EXPECT_FALSE(parsed.ok());
+    EXPECT_EQ(parsed.error(), trading::oms::ParseError::kUnsupportedMessageType);
+}
+
+TEST(OrderManagerTest, SendsIntentToTransport) {
+    trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    FakeOmsTransport transport;
+    CollectingOrderEventSink event_sink;
+    trading::oms::OrderManager manager{
+        adapter,
+        transport,
+        event_sink,
+        trading::oms::OrderManagerConfig{
+            .transport =
+                trading::oms::OrderTransportConfig{
+                    .endpoint = "wss://example.test/orders",
+                },
+            .loop_idle_sleep = std::chrono::milliseconds{1},
+        },
+    };
+    ASSERT_TRUE(manager.start());
+
+    const auto request_id = manager.submit(trading::internal::OrderIntent{
+        .exchange = trading::internal::ExchangeId::kKalshi,
+        .action = trading::internal::OmsAction::kPlace,
+        .client_order_id = "cl-200",
+        .market_ticker = "KXBTC-YES",
+        .side = trading::internal::Side::kBuy,
+        .qty_lots = 12,
+        .limit_price_ticks = 55,
+        .time_in_force = trading::internal::OmsTimeInForce::kGtc,
+    });
+    ASSERT_TRUE(request_id.has_value());
+
+    ASSERT_TRUE(wait_until([&transport] { return transport.sent_count() == 1; },
+                           std::chrono::milliseconds{100}));
+
+    const auto sent_payloads = transport.sent_payloads();
+    ASSERT_EQ(sent_payloads.size(), 1U);
+    const auto sent_json = nlohmann::json::parse(sent_payloads.front());
+    EXPECT_EQ(sent_json.at("action"), "place_order");
+    EXPECT_EQ(sent_json.at("client_order_id"), "cl-200");
+
+    manager.stop();
+    const auto stats = manager.stats();
+    EXPECT_EQ(stats.submitted_count, 1U);
+    EXPECT_EQ(stats.sent_count, 1U);
+    EXPECT_EQ(stats.send_failed_count, 0U);
+    EXPECT_EQ(stats.receive_count, 0U);
+}
+
+TEST(OrderManagerTest, DispatchesParsedUpdateToSink) {
+    constexpr std::string_view kInboundAck = R"({
+        "type": "order_ack",
+        "recv_ts_ns": 88,
+        "msg": {
+            "client_order_id": "cl-200",
+            "exchange_order_id": "ex-200",
+            "market_ticker": "KXBTC-YES",
+            "accepted_qty": 12
+        }
+    })";
+
+    trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    FakeOmsTransport transport;
+    CollectingOrderEventSink event_sink;
+    transport.queue_inbound(std::string{kInboundAck});
+
+    trading::oms::OrderManager manager{
+        adapter,
+        transport,
+        event_sink,
+        trading::oms::OrderManagerConfig{
+            .transport =
+                trading::oms::OrderTransportConfig{
+                    .endpoint = "wss://example.test/orders",
+                },
+            .loop_idle_sleep = std::chrono::milliseconds{1},
+        },
+    };
+    ASSERT_TRUE(manager.start());
+    ASSERT_TRUE(wait_until([&event_sink] { return event_sink.update_count() == 1; },
+                           std::chrono::milliseconds{100}));
+
+    const auto update_value =
+        event_sink.last_update().value_or(trading::internal::OrderStateUpdate{});
+    EXPECT_EQ(update_value.status, trading::internal::OmsOrderStatus::kAccepted);
+    EXPECT_EQ(update_value.client_order_id, "cl-200");
+
+    manager.stop();
+    const auto stats = manager.stats();
+    EXPECT_EQ(stats.receive_count, 1U);
+    EXPECT_EQ(stats.parse_failed_count, 0U);
+}
+
+TEST(OrderManagerTest, RejectsUnsupportedIntentBeforeQueueing) {
+    trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    FakeOmsTransport transport;
+    CollectingOrderEventSink event_sink;
+    trading::oms::OrderManager manager{
+        adapter,
+        transport,
+        event_sink,
+        trading::oms::OrderManagerConfig{
+            .transport =
+                trading::oms::OrderTransportConfig{
+                    .endpoint = "wss://example.test/orders",
+                },
+            .loop_idle_sleep = std::chrono::milliseconds{1},
+        },
+    };
+    ASSERT_TRUE(manager.start());
+
+    const auto request_id = manager.submit(trading::internal::OrderIntent{
+        .exchange = trading::internal::ExchangeId::kPolymarket,
+        .action = trading::internal::OmsAction::kPlace,
+        .client_order_id = "cl-unsupported",
+    });
+    EXPECT_FALSE(request_id.has_value());
+
+    manager.stop();
+    const auto stats = manager.stats();
+    EXPECT_EQ(stats.unsupported_intent_count, 1U);
+    EXPECT_EQ(stats.submitted_count, 0U);
+    EXPECT_EQ(stats.pending_intent_count, 0U);
+}
+
+TEST(OrderManagerTest, StartFailsWhenTransportConnectFails) {
+    trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    FakeOmsTransport transport;
+    transport.set_connect_result(false);
+    CollectingOrderEventSink event_sink;
+    trading::oms::OrderManager manager{
+        adapter,
+        transport,
+        event_sink,
+        trading::oms::OrderManagerConfig{
+            .transport =
+                trading::oms::OrderTransportConfig{
+                    .endpoint = "wss://example.test/orders",
+                },
+        },
+    };
+
+    EXPECT_FALSE(manager.start());
+    EXPECT_FALSE(manager.running());
+    EXPECT_EQ(manager.last_error(), "connect failed");
 }
 
 TEST(WsSessionTest, ConnectBuildsKalshiHeaders) {
