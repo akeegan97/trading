@@ -25,6 +25,14 @@ add_library(trading_adapters_logging src/adapters/logging/logger.cpp)
 target_include_directories(trading_adapters_logging PUBLIC include)
 target_link_libraries(trading_adapters_logging PUBLIC spdlog::spdlog)
 
+add_library(trading_adapters_oms src/adapters/exchanges/kalshi/oms_adapter.cpp)
+target_include_directories(trading_adapters_oms PUBLIC include)
+target_link_libraries(trading_adapters_oms PUBLIC nlohmann_json::nlohmann_json)
+
+add_library(trading_oms_runtime src/oms/order_manager.cpp)
+target_include_directories(trading_oms_runtime PUBLIC include)
+target_link_libraries(trading_oms_runtime PUBLIC trading_adapters_oms)
+
 add_library(
   trading_adapters_ws
   src/adapters/ws/client.cpp
@@ -89,6 +97,8 @@ if(BUILD_TESTING)
     trading_tests
     PRIVATE trading_core
             trading_engine
+            trading_adapters_oms
+            trading_oms_runtime
             trading_adapters_ws
             trading_pipeline
             GTest::gtest_main
