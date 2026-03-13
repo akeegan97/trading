@@ -1,98 +1,120 @@
-# Trading Repo
+# Trading Infrastructure Engine (C++)
 
-This repository is set up for a PR-driven workflow with automated CI checks for C++ (CMake + clang) and Python.
+This repository is a systems-engineering project for building market-data and order-management plumbing used by automated trading systems.
 
-Checks should run in both places:
-- Locally before pushing (fast feedback)
-- In GitHub Actions on every PR (merge gate and audit trail)
+The focus is infrastructure quality:
+- deterministic ingest -> decode -> route -> shard execution flow
+- explicit data contracts between stages
+- testable exchange adapters (Kalshi + Polymarket decode paths)
+- runtime safety surfaces (drop counters, parse failures, startup error paths)
+- CI-enforced build, formatting, linting, and tests
 
-Performance optimization ideas tracked here:
-- [`docs/perf_backlog.md`](docs/perf_backlog.md)
+## What Exists Today
 
-Pipeline handoff contract is documented here:
-- [`docs/data_contract.md`](docs/data_contract.md)
+- `trader_app`: live websocket ingest (Kalshi), message pipeline, shard-local order book state.
+- `logger_app`: minimal runtime bootstrap binary.
+- Pipeline stack:
+  - frame pool + SPSC ingest queue
+  - extract/normalize dispatch
+  - keyed router and shard fanout
+  - shard parser + `BookStore` apply
+- OMS stack (scaffolded and tested):
+  - canonical order intent/update contract
+  - exchange OMS adapter interface + Kalshi implementation
+  - runtime `OrderManager` with outbound/inbound loops
+- Tests: parser, routing, pipeline, config loading, auth signing, OMS adapter/runtime.
 
-Trader runtime config drop-file example:
-- [`docs/trader_config.example.json`](docs/trader_config.example.json)
+## Architecture
 
-## Workflow
+```text
+Kalshi WS -> FramePoolMessageSink -> SPSC Frame Queue -> Router -> Shard Queues
+                                                            |
+                                                            v
+                                                  Shard Parser -> NormalizedEvent -> BookStore
 
-1. Create a branch from `main`:
-   - `feat/<short-description>`
-   - `fix/<short-description>`
-   - `chore/<short-description>`
-2. Push your branch and open a pull request.
-3. Wait for CI to pass.
-4. Merge via **Squash and merge**.
-
-Direct pushes to `main` should be blocked by branch protection.
-
-## GitHub Setup Checklist
-
-After pushing this repo to GitHub, configure:
-
-1. Set default branch to `main`.
-2. Enable branch protection on `main`:
-   - Require a pull request before merging
-   - For solo use: approvals optional (set required approvals to 0)
-   - For team use: require at least 1 approval
-   - Dismiss stale approvals when new commits are pushed
-   - Optional for solo use: Require review from Code Owners
-   - Require status checks to pass before merging
-   - Required checks: select the check names shown after the first CI run. Recommended:
-     - `CI / Baseline checks`
-     - `CI / C++ clang-format`
-     - `CI / C++ CMake build + clang-tidy + tests` (when using CMake)
-     - `CI / Python ruff + pytest` (when using Python)
-   - Require conversation resolution before merging
-   - Include administrators
-   - Disable force pushes and deletions
-3. In repository settings, disable merge methods you do not want (recommended: keep only Squash merge).
-
-## Local Commands (Match CI)
-
-```bash
-# C++ format check
-clang-format --dry-run --Werror $(git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hh' '*.hpp' '*.hxx')
-
-# C++ configure/build/test via presets
-cmake --preset ci
-cmake --build --preset build-ci --parallel
-ctest --preset test-ci
-
-# C++ clang-tidy
-clang-tidy -p build/ci --warnings-as-errors='*' $(git ls-files '*.cc' '*.cpp' '*.cxx')
-
-# Python lint/test
-ruff check .
-pytest -q
+Strategy -> OrderIntent -> OrderManager -> ExchangeOmsAdapter -> OrderTransport
+                                                     ^                |
+                                                     |                v
+                                              IOrderEventSink <- parse_update
 ```
 
-## vcpkg Guidance
+Pipeline contract details: [`docs/data_contract.md`](docs/data_contract.md)  
+Performance roadmap: [`docs/perf_backlog.md`](docs/perf_backlog.md)
 
-Use `vcpkg` only when you have non-trivial C++ dependencies to manage across machines/CI.
+## Tech Stack
 
-- If dependencies are minimal or system-provided: skip `vcpkg` for now.
-- If you add multiple third-party C++ libs: use `vcpkg` manifest mode.
+- Language: C++20
+- Build: CMake + Ninja
+- Dependencies: `boost`, `openssl`, `nlohmann_json`, `simdjson`, `spdlog`, `gtest` (via `vcpkg`)
+- Quality gates: `clang-format`, `clang-tidy`, `ctest`, GitHub Actions CI
 
-This repo includes optional presets (`dev-vcpkg`, `rel-vcpkg`, `ci-vcpkg`) that use
-`$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake`.
+## Quickstart
 
-## First Push
+### 1) Prerequisites
+
+- `clang`, `clang++`, `clang-tidy`
+- `cmake` (>= 3.24), `ninja`
+- `git`
+- `vcpkg` (recommended; CI uses manifest mode)
+
+### 2) Configure + Build
 
 ```bash
-git add .
-git commit -m "chore: bootstrap repo standards"
-git remote add origin <your-github-repo-url>
-git push -u origin main
+# if using vcpkg presets
+export VCPKG_ROOT=/path/to/vcpkg
+cmake --preset dev-vcpkg
+cmake --build --preset build-dev-vcpkg --parallel
 ```
 
-## Running Trader App With Drop File
+If you have all dependencies installed system-wide, you can use non-vcpkg presets:
 
 ```bash
-# pass file path directly
-./build/dev/cpp/trader_app docs/trader_config.example.json
-
-# or by env var
-TRADING_CONFIG_PATH=docs/trader_config.example.json ./build/dev/cpp/trader_app
+cmake --preset dev
+cmake --build --preset build-dev --parallel
 ```
+
+### 3) Run Tests
+
+```bash
+ctest --preset test-dev-vcpkg
+# or: ctest --preset test-dev
+```
+
+### 4) Run Trader App
+
+```bash
+# credentials required (or set inline in config)
+export KALSHI_KEY_ID=...
+export KALSHI_PRIVATE_KEY_PEM='-----BEGIN PRIVATE KEY-----...'
+
+./build/dev/cpp/trader_app --config docs/trader_config.example.json
+```
+
+You can also pass config path positionally or via `TRADING_CONFIG_PATH`.
+
+## Runtime Config
+
+Example drop-file: [`docs/trader_config.example.json`](docs/trader_config.example.json)
+
+Key knobs:
+- mode (`paper`, `dev`, etc.)
+- websocket endpoint and channel list
+- frame pool/queue capacities
+- shard count and queue sizing
+- pump batch size and idle sleep
+
+## Repository Layout
+
+- `cpp/apps` executable entrypoints
+- `cpp/include/trading` public interfaces and contracts
+- `cpp/src` implementations
+- `cpp/tests` integration and unit tests
+- `docs` data contracts, config example, perf backlog
+
+## Engineering Workflow
+
+- Work from short-lived branches (`feat/*`, `fix/*`, `chore/*`)
+- Open PRs early, keep scope focused
+- Merge via squash after CI passes
+
+Contribution details: [`CONTRIBUTING.md`](CONTRIBUTING.md)
