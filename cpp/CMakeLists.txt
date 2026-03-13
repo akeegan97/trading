@@ -29,7 +29,7 @@ add_library(trading_adapters_oms src/adapters/exchanges/kalshi/oms_adapter.cpp)
 target_include_directories(trading_adapters_oms PUBLIC include)
 target_link_libraries(trading_adapters_oms PUBLIC nlohmann_json::nlohmann_json)
 
-add_library(trading_oms_runtime src/oms/order_manager.cpp)
+add_library(trading_oms_runtime src/oms/global_risk_gate.cpp src/oms/order_manager.cpp)
 target_include_directories(trading_oms_runtime PUBLIC include)
 target_link_libraries(trading_oms_runtime PUBLIC trading_adapters_oms)
 
