@@ -46,25 +46,19 @@ This file tracks deliberate performance work I'm deferring, planning to run targ
 
 ## OMS runtime candidates (medium priority)
 
-1. Replace centralized OMS ingress queue with per-shard bounded SPSC queues.
-   - Current state: `submit()` uses one central `std::deque` protected by `std::mutex` in `OrderManager`.
-   - Target: one shard -> OMS SPSC ring per shard, lock-free atomic head/tail, explicit backpressure policy.
-2. Add batched drain/send scheduling across shard ingress queues.
-   - Current state: OMS drains one central queue item-by-item.
-   - Target: fair round-robin (or weighted) queue polling with per-queue batch size to amortize atomic load/store and reduce scheduler overhead.
-3. Replace OMS idle polling with producer-driven wakeup.
-   - Current state: worker loop sleeps when no work (`loop_idle_sleep`), adding idle latency/CPU tradeoff.
-   - Target: wake mechanism (eventfd/condition variable/queue semaphore + non-empty bitset) so OMS blocks when idle and wakes on enqueue.
-4. Split OMS send/receive loops when outbound or inbound rates diverge.
+1. Replace `OrderManager` mutex/deque intent queue with a bounded lock-free queue.
+   - Current state: `submit()` pushes into a `std::deque` behind `std::mutex`.
+   - Target: SPSC (or MPSC if needed) ring buffer with explicit backpressure policy.
+2. Split OMS send/receive loops when outbound or inbound rates diverge.
    - Current state: one worker thread handles both `drain_outbound_intents()` and `pump_incoming_update()`.
    - Target: dedicated send and receive workers (or event loop) to reduce head-of-line blocking.
-5. Remove avoidable OMS payload copies/allocations.
+3. Remove avoidable OMS payload copies/allocations.
    - Current state: request build + update parse paths allocate `std::string` payloads per message.
    - Target: reuse buffers/allocators and add zero-copy parse path where exchange payload format allows.
-6. Optimize in-flight order state store for high-rate lookup/update.
-   - Current state: in-flight lifecycle state exists, but with mutex-protected hash maps and simple indexing.
-   - Target: pre-sized/sharded table keyed by client/exchange order id with lower contention and predictable allocation behavior.
-7. Add explicit queue pressure metrics and rejection behavior.
+4. Add in-flight order state store optimized for hot lookup/update.
+   - Current state: updates are forwarded downstream but no local high-performance lifecycle table yet.
+   - Target: pre-sized hash map or sharded table keyed by client/exchange order id with low-allocation transitions.
+5. Add explicit queue pressure metrics and rejection behavior.
    - Current state: queue depth is observable, but no strict bounded rejection/timeout strategy tied to SLA.
    - Target: define and measure deterministic behavior under burst load (reject, block, or shed by policy).
 
