@@ -27,6 +27,7 @@
 #include "trading/internal/router_frame.hpp"
 #include "trading/oms/global_risk_gate.hpp"
 #include "trading/oms/order_manager.hpp"
+#include "trading/oms/paper_order_transport.hpp"
 #include "trading/oms/portfolio_risk_gate.hpp"
 #include "trading/oms/position_ledger.hpp"
 #include "trading/oms/ws_order_transport.hpp"
@@ -611,6 +612,7 @@ TEST(TraderConfigTest, ParsesDropFileOverrides) {
             "shard_idle_sleep_ms": 0
         },
         "runtime": {
+            "execution_mode": "paper",
             "pump_batch_size": 256,
             "pump_idle_sleep_ms": 2
         }
@@ -629,6 +631,7 @@ TEST(TraderConfigTest, ParsesDropFileOverrides) {
     EXPECT_EQ(loaded.config.pipeline.router_exchange, trading::internal::ExchangeId::kKalshi);
     EXPECT_EQ(loaded.config.pipeline.frame_pool_capacity, 2048U);
     EXPECT_EQ(loaded.config.pipeline.shard_count, 8U);
+    EXPECT_EQ(loaded.config.execution_mode, trading::config::TraderExecutionMode::kPaper);
     EXPECT_EQ(loaded.config.pump_batch_size, 256U);
     EXPECT_EQ(loaded.config.pump_idle_sleep, std::chrono::milliseconds{2});
 }
@@ -643,6 +646,18 @@ TEST(TraderConfigTest, RejectsUnknownExchange) {
     const auto loaded = trading::config::load_trader_config_from_json(kConfig);
     EXPECT_FALSE(loaded.ok);
     EXPECT_NE(loaded.error.find("pipeline.exchange"), std::string::npos);
+}
+
+TEST(TraderConfigTest, RejectsUnknownExecutionMode) {
+    constexpr std::string_view kConfig = R"({
+        "runtime": {
+            "execution_mode": "turbo-live"
+        }
+    })";
+
+    const auto loaded = trading::config::load_trader_config_from_json(kConfig);
+    EXPECT_FALSE(loaded.ok);
+    EXPECT_NE(loaded.error.find("runtime.execution_mode"), std::string::npos);
 }
 
 TEST(KalshiOmsAdapterTest, BuildsPlaceRequestPayload) {
@@ -2390,6 +2405,58 @@ TEST(PositionLedgerTest, BuildsPortfolioRiskSnapshotByExchangeAndMarket) {
     EXPECT_EQ(polymarket_snapshot.net_position_market, 2);
     EXPECT_EQ(polymarket_snapshot.gross_position_global, 2);
     EXPECT_EQ(polymarket_snapshot.realized_pnl_ticks_total, 0);
+}
+
+TEST(PaperOrderTransportTest, PlaceRequestEmitsAckThenFill) {
+    trading::oms::PaperOrderTransport transport;
+    ASSERT_TRUE(transport.connect(trading::oms::OrderTransportConfig{
+        .endpoint = "paper://oms",
+    }));
+
+    const bool sent = transport.send_text(R"({
+        "action": "place_order",
+        "client_order_id": "cl-paper-1",
+        "market_ticker": "KXBTC-YES",
+        "side": "buy",
+        "qty": 3,
+        "limit_price": 47,
+        "time_in_force": "gtc"
+    })");
+    ASSERT_TRUE(sent);
+
+    const auto ack_payload = transport.recv_text();
+    ASSERT_TRUE(ack_payload.has_value());
+    const auto ack = nlohmann::json::parse(ack_payload.value_or(""));
+    EXPECT_EQ(ack.at("type"), "order_ack");
+    EXPECT_EQ(ack.at("msg").at("client_order_id"), "cl-paper-1");
+    EXPECT_EQ(ack.at("msg").at("market_ticker"), "KXBTC-YES");
+    EXPECT_EQ(ack.at("msg").at("accepted_qty"), 3);
+
+    const auto fill_payload = transport.recv_text();
+    ASSERT_TRUE(fill_payload.has_value());
+    const auto fill = nlohmann::json::parse(fill_payload.value_or(""));
+    EXPECT_EQ(fill.at("type"), "fill");
+    EXPECT_EQ(fill.at("msg").at("client_order_id"), "cl-paper-1");
+    EXPECT_EQ(fill.at("msg").at("fill_qty"), 3);
+    EXPECT_EQ(fill.at("msg").at("fill_price"), 47);
+    EXPECT_EQ(fill.at("msg").at("side"), "buy");
+}
+
+TEST(PaperOrderTransportTest, RejectsUnsupportedActions) {
+    trading::oms::PaperOrderTransport transport;
+    ASSERT_TRUE(transport.connect(trading::oms::OrderTransportConfig{
+        .endpoint = "paper://oms",
+    }));
+
+    ASSERT_TRUE(transport.send_text(R"({
+        "action": "cancel_order",
+        "client_order_id": "cl-paper-cancel-1"
+    })"));
+    const auto reject_payload = transport.recv_text();
+    ASSERT_TRUE(reject_payload.has_value());
+    const auto reject = nlohmann::json::parse(reject_payload.value_or(""));
+    EXPECT_EQ(reject.at("type"), "order_reject");
+    EXPECT_EQ(reject.at("msg").at("reason_code"), "paper_action_unsupported");
 }
 
 TEST(WsOrderTransportTest, ProxiesWsTransportConnectSendRecvAndClose) {

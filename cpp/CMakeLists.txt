@@ -34,6 +34,7 @@ add_library(
   src/oms/global_risk_gate.cpp
   src/oms/order_manager_core.cpp
   src/oms/order_manager.cpp
+  src/oms/paper_order_transport.cpp
   src/oms/portfolio_risk_gate.cpp
   src/oms/position_ledger_core.cpp
   src/oms/position_ledger.cpp

@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -10,6 +11,14 @@
 #include "trading/pipeline/live_pipeline.hpp"
 
 namespace trading::config {
+
+enum class TraderExecutionMode : std::uint8_t {
+    kLive = 0,
+    kPaper = 1,
+    kMarketDataOnly = 2,
+};
+
+[[nodiscard]] std::string_view execution_mode_name(TraderExecutionMode mode);
 
 struct CredentialConfig {
     std::string key_id;
@@ -26,6 +35,7 @@ struct KalshiWsConfig {
 
 struct TraderRuntimeConfig {
     std::string mode{"dev"};
+    TraderExecutionMode execution_mode{TraderExecutionMode::kLive};
     KalshiWsConfig kalshi{};
     pipeline::LivePipelineConfig pipeline{};
     std::size_t pump_batch_size{pipeline::LivePipeline::kDefaultPumpBatchSize};

@@ -28,6 +28,23 @@ bool parse_exchange_id(std::string_view name, decode::ExchangeId& out_decode,
     return false;
 }
 
+bool parse_execution_mode(std::string_view mode_name, TraderExecutionMode& out_mode) {
+    if (mode_name == "live") {
+        out_mode = TraderExecutionMode::kLive;
+        return true;
+    }
+    if (mode_name == "paper") {
+        out_mode = TraderExecutionMode::kPaper;
+        return true;
+    }
+    if (mode_name == "md-only" || mode_name == "md_only" || mode_name == "market-data-only" ||
+        mode_name == "market_data_only") {
+        out_mode = TraderExecutionMode::kMarketDataOnly;
+        return true;
+    }
+    return false;
+}
+
 bool parse_positive_size_t(const json& value, std::size_t& out, std::string& error,
                            std::string_view field_name) {
     if (!value.is_number_unsigned()) {
@@ -267,6 +284,19 @@ ConfigLoadResult parse_from_json(const json& root) {
                 return result;
             }
         }
+        if (const auto mode_it = runtime.find("execution_mode"); mode_it != runtime.end()) {
+            if (!mode_it->is_string()) {
+                result.ok = false;
+                result.error = "runtime.execution_mode must be a string";
+                return result;
+            }
+            if (!parse_execution_mode(mode_it->get<std::string>(), result.config.execution_mode)) {
+                result.ok = false;
+                result.error =
+                    "runtime.execution_mode must be one of: live, paper, md-only";
+                return result;
+            }
+        }
     }
 
     return result;
@@ -305,6 +335,18 @@ ConfigLoadResult load_trader_config_from_file(const std::string& path) {
         result.error = path + ": " + result.error;
     }
     return result;
+}
+
+std::string_view execution_mode_name(TraderExecutionMode mode) {
+    switch (mode) {
+    case TraderExecutionMode::kLive:
+        return "live";
+    case TraderExecutionMode::kPaper:
+        return "paper";
+    case TraderExecutionMode::kMarketDataOnly:
+        return "md-only";
+    }
+    return "unknown";
 }
 
 } // namespace trading::config

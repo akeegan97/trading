@@ -4,6 +4,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -20,11 +21,14 @@
 #include "trading/config/trader_config.hpp"
 #include "trading/engine/runtime.hpp"
 #include "trading/oms/order_manager.hpp"
+#include "trading/oms/paper_order_transport.hpp"
 #include "trading/oms/position_ledger.hpp"
 #include "trading/oms/ws_order_transport.hpp"
 #include "trading/pipeline/live_pipeline.hpp"
+#include "trading/strategy/dropping_order_intent_sink.hpp"
 #include "trading/strategy/noop_strategy.hpp"
 #include "trading/strategy/order_manager_intent_sink.hpp"
+#include "trading/strategy/order_intent_sink.hpp"
 #include "trading/strategy/strategy_event_handler.hpp"
 
 namespace {
@@ -66,6 +70,7 @@ std::optional<std::string> resolve_config_path(int argc, char** argv) {
 
 } // namespace
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int main(int argc, char** argv) {
     trading::config::TraderRuntimeConfig runtime_config{};
     const auto config_path = resolve_config_path(argc, argv);
@@ -81,6 +86,10 @@ int main(int argc, char** argv) {
     }
 
     const auto startup = trading::engine::build_trader_startup_payload(runtime_config.mode);
+    const bool run_live_oms = runtime_config.execution_mode == trading::config::TraderExecutionMode::kLive;
+    const bool run_paper_oms =
+        runtime_config.execution_mode == trading::config::TraderExecutionMode::kPaper;
+    const bool run_oms = run_live_oms || run_paper_oms;
 
     const auto key_id = runtime_config.kalshi.credentials.key_id.empty()
                             ? get_env(runtime_config.kalshi.credentials.key_id_env.c_str())
@@ -104,37 +113,56 @@ int main(int argc, char** argv) {
         runtime_config.kalshi.endpoint,
     };
 
-    const auto oms_auth_headers =
-        trading::adapters::exchanges::kalshi::AuthSigner{kalshi_credentials}.make_ws_headers();
-    trading::adapters::ws::BoostBeastWsTransport oms_ws_transport;
-    trading::oms::WsOrderTransport oms_transport{oms_ws_transport};
     trading::adapters::exchanges::kalshi::OmsAdapter oms_adapter;
     trading::oms::PositionLedger position_ledger;
-    trading::oms::OrderManager order_manager{
-        oms_adapter,
-        oms_transport,
-        position_ledger,
-        trading::oms::OrderManagerConfig{
-            .transport =
-                trading::oms::OrderTransportConfig{
-                    .endpoint = runtime_config.kalshi.endpoint,
-                    .headers =
-                        {
-                            {"KALSHI-ACCESS-KEY", oms_auth_headers.key_id},
-                            {"KALSHI-ACCESS-TIMESTAMP", oms_auth_headers.timestamp_ms},
-                            {"KALSHI-ACCESS-SIGNATURE", oms_auth_headers.signature_base64},
-                        },
-                },
-            .portfolio_snapshot_provider = &position_ledger,
-            .loop_idle_sleep = std::chrono::milliseconds{1},
-        },
-    };
-    if (!order_manager.start()) {
-        trading::adapters::logging::log_startup(
-            "trader.error", "failed to start order manager: " + order_manager.last_error());
-        return kExitOmsStartFailure;
+    std::unique_ptr<trading::adapters::ws::BoostBeastWsTransport> oms_ws_transport;
+    std::unique_ptr<trading::oms::IOrderTransport> oms_transport;
+    std::unique_ptr<trading::oms::OrderManager> order_manager;
+    std::unique_ptr<trading::strategy::OrderManagerIntentSink> order_manager_intent_sink;
+    std::unique_ptr<trading::strategy::DroppingOrderIntentSink> dropping_intent_sink;
+    trading::strategy::IOrderIntentSink* strategy_intent_sink{nullptr};
+
+    if (run_oms) {
+        std::map<std::string, std::string> oms_headers;
+        std::string oms_endpoint = "paper://oms";
+        if (run_live_oms) {
+            const auto oms_auth_headers =
+                trading::adapters::exchanges::kalshi::AuthSigner{kalshi_credentials}.make_ws_headers();
+            oms_headers = {
+                {"KALSHI-ACCESS-KEY", oms_auth_headers.key_id},
+                {"KALSHI-ACCESS-TIMESTAMP", oms_auth_headers.timestamp_ms},
+                {"KALSHI-ACCESS-SIGNATURE", oms_auth_headers.signature_base64},
+            };
+            oms_endpoint = runtime_config.kalshi.endpoint;
+            oms_ws_transport = std::make_unique<trading::adapters::ws::BoostBeastWsTransport>();
+            oms_transport = std::make_unique<trading::oms::WsOrderTransport>(*oms_ws_transport);
+        } else {
+            oms_transport = std::make_unique<trading::oms::PaperOrderTransport>();
+        }
+
+        order_manager = std::make_unique<trading::oms::OrderManager>(
+            oms_adapter, *oms_transport, position_ledger,
+            trading::oms::OrderManagerConfig{
+                .transport =
+                    trading::oms::OrderTransportConfig{
+                        .endpoint = std::move(oms_endpoint),
+                        .headers = std::move(oms_headers),
+                    },
+                .portfolio_snapshot_provider = &position_ledger,
+                .loop_idle_sleep = std::chrono::milliseconds{1},
+            });
+        if (!order_manager->start()) {
+            trading::adapters::logging::log_startup(
+                "trader.error", "failed to start order manager: " + order_manager->last_error());
+            return kExitOmsStartFailure;
+        }
+        order_manager_intent_sink =
+            std::make_unique<trading::strategy::OrderManagerIntentSink>(*order_manager);
+        strategy_intent_sink = order_manager_intent_sink.get();
+    } else {
+        dropping_intent_sink = std::make_unique<trading::strategy::DroppingOrderIntentSink>();
+        strategy_intent_sink = dropping_intent_sink.get();
     }
-    trading::strategy::OrderManagerIntentSink strategy_intent_sink{order_manager};
 
     const std::size_t strategy_shard_count = std::max<std::size_t>(runtime_config.pipeline.shard_count, 1U);
     std::vector<std::unique_ptr<trading::strategy::NoopStrategy>> shard_strategies;
@@ -144,8 +172,11 @@ int main(int argc, char** argv) {
         shard_strategies.push_back(std::make_unique<trading::strategy::NoopStrategy>());
     }
     runtime_config.pipeline.shard_event_handler_factory =
-        [&shard_strategies, &strategy_intent_sink](std::size_t shard_id)
+        [strategy_intent_sink, &shard_strategies](std::size_t shard_id)
         -> std::unique_ptr<trading::shards::IShardEventHandler> {
+        if (strategy_intent_sink == nullptr) {
+            return nullptr;
+        }
         if (shard_id >= shard_strategies.size()) {
             return nullptr;
         }
@@ -153,12 +184,14 @@ int main(int argc, char** argv) {
             return nullptr;
         }
         return std::make_unique<trading::strategy::StrategyEventHandler>(
-            *shard_strategies[shard_id], strategy_intent_sink);
+            *shard_strategies[shard_id], *strategy_intent_sink);
     };
 
     trading::pipeline::LivePipeline pipeline{runtime_config.pipeline};
     if (!pipeline.start()) {
-        order_manager.stop();
+        if (order_manager != nullptr) {
+            order_manager->stop();
+        }
         trading::adapters::logging::log_startup("trader.error", "failed to start pipeline");
         return kExitPipelineStartFailure;
     }
@@ -175,12 +208,17 @@ int main(int argc, char** argv) {
     };
     if (!feed_runner.start()) {
         pipeline.stop();
-        order_manager.stop();
+        if (order_manager != nullptr) {
+            order_manager->stop();
+        }
         trading::adapters::logging::log_startup("trader.error", "failed to start ws feed runner");
         return kExitFeedRunnerStartFailure;
     }
 
     trading::adapters::logging::log_startup("trader", startup);
+    trading::adapters::logging::log_startup(
+        "trader.execution_mode",
+        std::string{trading::config::execution_mode_name(runtime_config.execution_mode)});
     std::signal(SIGINT, handle_shutdown_signal);
     std::signal(SIGTERM, handle_shutdown_signal);
 
@@ -194,12 +232,17 @@ int main(int argc, char** argv) {
 
     feed_runner.stop();
     pipeline.stop();
-    order_manager.stop();
+    if (order_manager != nullptr) {
+        order_manager->stop();
+    }
 
     const auto pipeline_stats = pipeline.stats();
     const auto feed_received = feed_runner.received_count();
     const auto feed_dropped = feed_runner.dropped_count();
-    const auto oms_stats = order_manager.stats();
+    trading::oms::OrderManagerStats oms_stats{};
+    if (order_manager != nullptr) {
+        oms_stats = order_manager->stats();
+    }
     const std::string summary =
         "frames_pumped=" + std::to_string(pipeline_stats.ingest_frames_pumped) +
         ", routed=" + std::to_string(pipeline_stats.route_success) +
