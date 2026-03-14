@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "support/fake_ws_transport.hpp"
@@ -40,6 +41,8 @@
 #include "trading/shards/message_parser.hpp"
 #include "trading/strategy/order_intent_sink.hpp"
 #include "trading/strategy/order_manager_intent_sink.hpp"
+#include "trading/strategy/ledger_shard_risk_snapshot_provider.hpp"
+#include "trading/strategy/market_filter_event_handler.hpp"
 #include "trading/strategy/shard_risk_gate.hpp"
 #include "trading/strategy/shard_risk_snapshot_provider.hpp"
 #include "trading/strategy/strategy_event_handler.hpp"
@@ -611,6 +614,28 @@ TEST(TraderConfigTest, ParsesDropFileOverrides) {
             "per_shard_queue_capacity": 512,
             "shard_idle_sleep_ms": 0
         },
+        "market_universe": {
+            "tickers": ["KXBTC-YES", "KXETH-YES"]
+        },
+        "risk": {
+            "shard": {
+                "max_open_orders_per_market": 5,
+                "max_working_qty_per_market": 100,
+                "max_abs_net_position_per_market": 25
+            },
+            "oms_global": {
+                "max_active_orders_global": 50,
+                "max_active_orders_per_market": 10,
+                "max_outstanding_qty_global": 1000,
+                "max_outstanding_qty_per_market": 100
+            },
+            "oms_portfolio": {
+                "max_abs_net_position_per_market": 50,
+                "max_abs_position_gross_global": 200,
+                "min_realized_pnl_ticks": -500,
+                "enforce_realized_pnl_floor": true
+            }
+        },
         "runtime": {
             "execution_mode": "paper",
             "pump_batch_size": 256,
@@ -631,6 +656,20 @@ TEST(TraderConfigTest, ParsesDropFileOverrides) {
     EXPECT_EQ(loaded.config.pipeline.router_exchange, trading::internal::ExchangeId::kKalshi);
     EXPECT_EQ(loaded.config.pipeline.frame_pool_capacity, 2048U);
     EXPECT_EQ(loaded.config.pipeline.shard_count, 8U);
+    ASSERT_EQ(loaded.config.market_universe.tickers.size(), 2U);
+    EXPECT_EQ(loaded.config.market_universe.tickers[0], "KXBTC-YES");
+    EXPECT_EQ(loaded.config.market_universe.tickers[1], "KXETH-YES");
+    EXPECT_EQ(loaded.config.risk.shard.max_open_orders_per_market, 5U);
+    EXPECT_EQ(loaded.config.risk.shard.max_working_qty_per_market, 100);
+    EXPECT_EQ(loaded.config.risk.shard.max_abs_net_position_per_market, 25);
+    EXPECT_EQ(loaded.config.risk.oms_global.max_active_orders_global, 50U);
+    EXPECT_EQ(loaded.config.risk.oms_global.max_active_orders_per_market, 10U);
+    EXPECT_EQ(loaded.config.risk.oms_global.max_outstanding_qty_global, 1000);
+    EXPECT_EQ(loaded.config.risk.oms_global.max_outstanding_qty_per_market, 100);
+    EXPECT_EQ(loaded.config.risk.oms_portfolio.max_abs_net_position_per_market, 50);
+    EXPECT_EQ(loaded.config.risk.oms_portfolio.max_abs_position_gross_global, 200);
+    EXPECT_EQ(loaded.config.risk.oms_portfolio.min_realized_pnl_ticks, -500);
+    EXPECT_TRUE(loaded.config.risk.oms_portfolio.enforce_realized_pnl_floor);
     EXPECT_EQ(loaded.config.execution_mode, trading::config::TraderExecutionMode::kPaper);
     EXPECT_EQ(loaded.config.pump_batch_size, 256U);
     EXPECT_EQ(loaded.config.pump_idle_sleep, std::chrono::milliseconds{2});
@@ -658,6 +697,20 @@ TEST(TraderConfigTest, RejectsUnknownExecutionMode) {
     const auto loaded = trading::config::load_trader_config_from_json(kConfig);
     EXPECT_FALSE(loaded.ok);
     EXPECT_NE(loaded.error.find("runtime.execution_mode"), std::string::npos);
+}
+
+TEST(TraderConfigTest, RejectsInvalidRiskConfig) {
+    constexpr std::string_view kConfig = R"({
+        "risk": {
+            "shard": {
+                "max_abs_net_position_per_market": -1
+            }
+        }
+    })";
+
+    const auto loaded = trading::config::load_trader_config_from_json(kConfig);
+    EXPECT_FALSE(loaded.ok);
+    EXPECT_NE(loaded.error.find("risk.shard.max_abs_net_position_per_market"), std::string::npos);
 }
 
 TEST(KalshiOmsAdapterTest, BuildsPlaceRequestPayload) {
@@ -1179,6 +1232,36 @@ TEST(StrategyEventHandlerTest, DelegatesToRunnerAndIntentSink) {
     EXPECT_TRUE(handler.on_event(event));
     EXPECT_EQ(intent_sink.count(), 1U);
     EXPECT_EQ(handler.stats().intents_submitted_count, 1U);
+}
+
+TEST(LedgerShardRiskSnapshotProviderTest, ReturnsNetPositionFromPortfolioSnapshot) {
+    trading::oms::PositionLedger ledger;
+    ASSERT_TRUE(ledger.on_order_update(make_fill_update(
+        trading::internal::ExchangeId::kKalshi, "KXBTC-YES", "cl-ledger-1",
+        trading::internal::Side::kBuy, 7, 41, 1)));
+    ASSERT_TRUE(ledger.on_order_update(make_fill_update(
+        trading::internal::ExchangeId::kKalshi, "KXBTC-YES", "cl-ledger-2",
+        trading::internal::Side::kSell, 2, 43, 2)));
+
+    trading::strategy::LedgerShardRiskSnapshotProvider provider{ledger};
+    const auto snapshot =
+        provider.snapshot_for(trading::internal::ExchangeId::kKalshi, "KXBTC-YES");
+    EXPECT_EQ(snapshot.net_position_market, 5);
+    EXPECT_EQ(snapshot.open_orders_market, 0U);
+    EXPECT_EQ(snapshot.working_qty_market, 0);
+}
+
+TEST(MarketFilterEventHandlerTest, FiltersEventsByConfiguredMarkets) {
+    std::atomic<std::uint64_t> handled_count{0};
+    auto delegate = std::make_unique<CountingShardEventHandler>(handled_count);
+    trading::strategy::MarketFilterEventHandler handler{
+        std::unordered_set<std::string>{"KXBTC-YES"},
+        std::move(delegate),
+    };
+
+    EXPECT_TRUE(handler.on_event(make_trade_event("KXETH-YES", std::nullopt, 40, 1)));
+    EXPECT_TRUE(handler.on_event(make_trade_event("KXBTC-YES", std::nullopt, 41, 1)));
+    EXPECT_EQ(handled_count.load(std::memory_order_relaxed), 1U);
 }
 
 TEST(OrderManagerIntentSinkTest, SubmitsIntentIntoOrderManager) {

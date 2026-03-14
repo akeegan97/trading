@@ -60,6 +60,16 @@ bool parse_positive_size_t(const json& value, std::size_t& out, std::string& err
     return true;
 }
 
+bool parse_non_negative_size_t(const json& value, std::size_t& out, std::string& error,
+                               std::string_view field_name) {
+    if (!value.is_number_unsigned()) {
+        error = std::string(field_name) + " must be an unsigned integer";
+        return false;
+    }
+    out = value.get<std::size_t>();
+    return true;
+}
+
 bool parse_non_negative_ms(const json& value, std::chrono::milliseconds& out, std::string& error,
                            std::string_view field_name) {
     if (!value.is_number_integer()) {
@@ -72,6 +82,39 @@ bool parse_non_negative_ms(const json& value, std::chrono::milliseconds& out, st
         return false;
     }
     out = std::chrono::milliseconds{parsed};
+    return true;
+}
+
+bool parse_int64(const json& value, std::int64_t& out, std::string& error,
+                 std::string_view field_name) {
+    if (!value.is_number_integer()) {
+        error = std::string(field_name) + " must be an integer";
+        return false;
+    }
+    out = value.get<std::int64_t>();
+    return true;
+}
+
+bool parse_non_negative_qty(const json& value, internal::QtyLots& out, std::string& error,
+                            std::string_view field_name) {
+    std::int64_t parsed = 0;
+    if (!parse_int64(value, parsed, error, field_name)) {
+        return false;
+    }
+    if (parsed < 0) {
+        error = std::string(field_name) + " must be >= 0";
+        return false;
+    }
+    out = static_cast<internal::QtyLots>(parsed);
+    return true;
+}
+
+bool parse_bool(const json& value, bool& out, std::string& error, std::string_view field_name) {
+    if (!value.is_boolean()) {
+        error = std::string(field_name) + " must be a boolean";
+        return false;
+    }
+    out = value.get<bool>();
     return true;
 }
 
@@ -179,6 +222,168 @@ ConfigLoadResult parse_from_json(const json& root) {
                     return result;
                 }
                 result.config.kalshi.credentials.private_key_pem_env = value_it->get<std::string>();
+            }
+        }
+    }
+
+    if (const auto market_universe_it = root.find("market_universe");
+        market_universe_it != root.end()) {
+        if (!market_universe_it->is_object()) {
+            result.ok = false;
+            result.error = "market_universe must be an object";
+            return result;
+        }
+        const auto& market_universe = *market_universe_it;
+        if (const auto tickers_it = market_universe.find("tickers");
+            tickers_it != market_universe.end()) {
+            if (!parse_string_array(tickers_it.value(), result.config.market_universe.tickers,
+                                    result.error, "market_universe.tickers")) {
+                result.ok = false;
+                return result;
+            }
+        }
+    }
+
+    if (const auto risk_it = root.find("risk"); risk_it != root.end()) {
+        if (!risk_it->is_object()) {
+            result.ok = false;
+            result.error = "risk must be an object";
+            return result;
+        }
+        const auto& risk = *risk_it;
+
+        if (const auto shard_it = risk.find("shard"); shard_it != risk.end()) {
+            if (!shard_it->is_object()) {
+                result.ok = false;
+                result.error = "risk.shard must be an object";
+                return result;
+            }
+            const auto& shard = *shard_it;
+            if (const auto value_it = shard.find("max_open_orders_per_market");
+                value_it != shard.end()) {
+                if (!parse_non_negative_size_t(value_it.value(),
+                                               result.config.risk.shard.max_open_orders_per_market,
+                                               result.error,
+                                               "risk.shard.max_open_orders_per_market")) {
+                    result.ok = false;
+                    return result;
+                }
+            }
+            if (const auto value_it = shard.find("max_working_qty_per_market");
+                value_it != shard.end()) {
+                if (!parse_non_negative_qty(value_it.value(),
+                                            result.config.risk.shard.max_working_qty_per_market,
+                                            result.error,
+                                            "risk.shard.max_working_qty_per_market")) {
+                    result.ok = false;
+                    return result;
+                }
+            }
+            if (const auto value_it = shard.find("max_abs_net_position_per_market");
+                value_it != shard.end()) {
+                if (!parse_non_negative_qty(value_it.value(),
+                                            result.config.risk.shard.max_abs_net_position_per_market,
+                                            result.error,
+                                            "risk.shard.max_abs_net_position_per_market")) {
+                    result.ok = false;
+                    return result;
+                }
+            }
+        }
+
+        if (const auto oms_global_it = risk.find("oms_global"); oms_global_it != risk.end()) {
+            if (!oms_global_it->is_object()) {
+                result.ok = false;
+                result.error = "risk.oms_global must be an object";
+                return result;
+            }
+            const auto& oms_global = *oms_global_it;
+            if (const auto value_it = oms_global.find("max_active_orders_global");
+                value_it != oms_global.end()) {
+                if (!parse_non_negative_size_t(value_it.value(),
+                                               result.config.risk.oms_global.max_active_orders_global,
+                                               result.error,
+                                               "risk.oms_global.max_active_orders_global")) {
+                    result.ok = false;
+                    return result;
+                }
+            }
+            if (const auto value_it = oms_global.find("max_active_orders_per_market");
+                value_it != oms_global.end()) {
+                if (!parse_non_negative_size_t(
+                        value_it.value(),
+                        result.config.risk.oms_global.max_active_orders_per_market, result.error,
+                        "risk.oms_global.max_active_orders_per_market")) {
+                    result.ok = false;
+                    return result;
+                }
+            }
+            if (const auto value_it = oms_global.find("max_outstanding_qty_global");
+                value_it != oms_global.end()) {
+                if (!parse_non_negative_qty(
+                        value_it.value(), result.config.risk.oms_global.max_outstanding_qty_global,
+                        result.error, "risk.oms_global.max_outstanding_qty_global")) {
+                    result.ok = false;
+                    return result;
+                }
+            }
+            if (const auto value_it = oms_global.find("max_outstanding_qty_per_market");
+                value_it != oms_global.end()) {
+                if (!parse_non_negative_qty(
+                        value_it.value(),
+                        result.config.risk.oms_global.max_outstanding_qty_per_market, result.error,
+                        "risk.oms_global.max_outstanding_qty_per_market")) {
+                    result.ok = false;
+                    return result;
+                }
+            }
+        }
+
+        if (const auto oms_portfolio_it = risk.find("oms_portfolio");
+            oms_portfolio_it != risk.end()) {
+            if (!oms_portfolio_it->is_object()) {
+                result.ok = false;
+                result.error = "risk.oms_portfolio must be an object";
+                return result;
+            }
+            const auto& oms_portfolio = *oms_portfolio_it;
+            if (const auto value_it = oms_portfolio.find("max_abs_net_position_per_market");
+                value_it != oms_portfolio.end()) {
+                if (!parse_non_negative_qty(
+                        value_it.value(),
+                        result.config.risk.oms_portfolio.max_abs_net_position_per_market,
+                        result.error, "risk.oms_portfolio.max_abs_net_position_per_market")) {
+                    result.ok = false;
+                    return result;
+                }
+            }
+            if (const auto value_it = oms_portfolio.find("max_abs_position_gross_global");
+                value_it != oms_portfolio.end()) {
+                if (!parse_non_negative_qty(
+                        value_it.value(),
+                        result.config.risk.oms_portfolio.max_abs_position_gross_global, result.error,
+                        "risk.oms_portfolio.max_abs_position_gross_global")) {
+                    result.ok = false;
+                    return result;
+                }
+            }
+            if (const auto value_it = oms_portfolio.find("min_realized_pnl_ticks");
+                value_it != oms_portfolio.end()) {
+                if (!parse_int64(value_it.value(),
+                                 result.config.risk.oms_portfolio.min_realized_pnl_ticks,
+                                 result.error, "risk.oms_portfolio.min_realized_pnl_ticks")) {
+                    result.ok = false;
+                    return result;
+                }
+            }
+            if (const auto value_it = oms_portfolio.find("enforce_realized_pnl_floor");
+                value_it != oms_portfolio.end()) {
+                if (!parse_bool(value_it.value(),
+                                result.config.risk.oms_portfolio.enforce_realized_pnl_floor,
+                                result.error, "risk.oms_portfolio.enforce_realized_pnl_floor")) {
+                    result.ok = false;
+                    return result;
+                }
             }
         }
     }

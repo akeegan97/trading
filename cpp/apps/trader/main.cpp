@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 
 #include "trading/adapters/exchanges/kalshi/auth_signer.hpp"
 #include "trading/adapters/exchanges/kalshi/oms_adapter.hpp"
@@ -26,6 +27,8 @@
 #include "trading/oms/ws_order_transport.hpp"
 #include "trading/pipeline/live_pipeline.hpp"
 #include "trading/strategy/dropping_order_intent_sink.hpp"
+#include "trading/strategy/ledger_shard_risk_snapshot_provider.hpp"
+#include "trading/strategy/market_filter_event_handler.hpp"
 #include "trading/strategy/noop_strategy.hpp"
 #include "trading/strategy/order_manager_intent_sink.hpp"
 #include "trading/strategy/order_intent_sink.hpp"
@@ -115,6 +118,8 @@ int main(int argc, char** argv) {
 
     trading::adapters::exchanges::kalshi::OmsAdapter oms_adapter;
     trading::oms::PositionLedger position_ledger;
+    trading::strategy::LedgerShardRiskSnapshotProvider shard_risk_snapshot_provider{
+        position_ledger};
     std::unique_ptr<trading::adapters::ws::BoostBeastWsTransport> oms_ws_transport;
     std::unique_ptr<trading::oms::IOrderTransport> oms_transport;
     std::unique_ptr<trading::oms::OrderManager> order_manager;
@@ -148,6 +153,8 @@ int main(int argc, char** argv) {
                         .endpoint = std::move(oms_endpoint),
                         .headers = std::move(oms_headers),
                     },
+                .global_risk = runtime_config.risk.oms_global,
+                .portfolio_risk = runtime_config.risk.oms_portfolio,
                 .portfolio_snapshot_provider = &position_ledger,
                 .loop_idle_sleep = std::chrono::milliseconds{1},
             });
@@ -165,6 +172,10 @@ int main(int argc, char** argv) {
     }
 
     const std::size_t strategy_shard_count = std::max<std::size_t>(runtime_config.pipeline.shard_count, 1U);
+    const std::unordered_set<std::string> allowed_strategy_markets{
+        runtime_config.market_universe.tickers.begin(),
+        runtime_config.market_universe.tickers.end(),
+    };
     std::vector<std::unique_ptr<trading::strategy::NoopStrategy>> shard_strategies;
     shard_strategies.reserve(strategy_shard_count);
     for (std::size_t shard_id = 0; shard_id < strategy_shard_count; ++shard_id) {
@@ -172,7 +183,8 @@ int main(int argc, char** argv) {
         shard_strategies.push_back(std::make_unique<trading::strategy::NoopStrategy>());
     }
     runtime_config.pipeline.shard_event_handler_factory =
-        [strategy_intent_sink, &shard_strategies](std::size_t shard_id)
+        [strategy_intent_sink, &shard_strategies, &runtime_config, &shard_risk_snapshot_provider,
+         allowed_strategy_markets](std::size_t shard_id)
         -> std::unique_ptr<trading::shards::IShardEventHandler> {
         if (strategy_intent_sink == nullptr) {
             return nullptr;
@@ -183,8 +195,17 @@ int main(int argc, char** argv) {
         if (shard_strategies[shard_id] == nullptr) {
             return nullptr;
         }
-        return std::make_unique<trading::strategy::StrategyEventHandler>(
-            *shard_strategies[shard_id], *strategy_intent_sink);
+        auto strategy_handler = std::make_unique<trading::strategy::StrategyEventHandler>(
+            *shard_strategies[shard_id], *strategy_intent_sink,
+            trading::strategy::StrategyRunnerConfig{
+                .shard_risk = runtime_config.risk.shard,
+                .risk_snapshot_provider = &shard_risk_snapshot_provider,
+            });
+        if (allowed_strategy_markets.empty()) {
+            return strategy_handler;
+        }
+        return std::make_unique<trading::strategy::MarketFilterEventHandler>(
+            allowed_strategy_markets, std::move(strategy_handler));
     };
 
     trading::pipeline::LivePipeline pipeline{runtime_config.pipeline};

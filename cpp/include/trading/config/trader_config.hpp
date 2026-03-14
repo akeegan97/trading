@@ -8,7 +8,10 @@
 #include <string_view>
 #include <vector>
 
+#include "trading/oms/global_risk_gate.hpp"
+#include "trading/oms/portfolio_risk_gate.hpp"
 #include "trading/pipeline/live_pipeline.hpp"
+#include "trading/strategy/shard_risk_gate.hpp"
 
 namespace trading::config {
 
@@ -33,10 +36,22 @@ struct KalshiWsConfig {
     CredentialConfig credentials{};
 };
 
+struct MarketUniverseConfig {
+    std::vector<std::string> tickers;
+};
+
+struct RiskConfig {
+    strategy::ShardRiskConfig shard{};
+    oms::GlobalRiskConfig oms_global{};
+    oms::PortfolioRiskConfig oms_portfolio{};
+};
+
 struct TraderRuntimeConfig {
     std::string mode{"dev"};
     TraderExecutionMode execution_mode{TraderExecutionMode::kLive};
     KalshiWsConfig kalshi{};
+    MarketUniverseConfig market_universe{};
+    RiskConfig risk{};
     pipeline::LivePipelineConfig pipeline{};
     std::size_t pump_batch_size{pipeline::LivePipeline::kDefaultPumpBatchSize};
     std::chrono::milliseconds pump_idle_sleep{std::chrono::milliseconds{1}};
