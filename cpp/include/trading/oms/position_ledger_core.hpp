@@ -9,6 +9,7 @@
 #include <unordered_map>
 
 #include "trading/internal/oms_types.hpp"
+#include "trading/oms/portfolio_risk_gate.hpp"
 
 namespace trading::oms {
 
@@ -41,6 +42,8 @@ class PositionLedgerCore final {
                                        std::string& error_message);
     [[nodiscard]] std::optional<PositionSnapshot>
     market_position(internal::ExchangeId exchange, std::string_view market_ticker) const;
+    [[nodiscard]] PortfolioRiskSnapshot
+    portfolio_risk_snapshot(internal::ExchangeId exchange, std::string_view market_ticker) const;
     [[nodiscard]] PositionLedgerStats stats() const;
 
   private:

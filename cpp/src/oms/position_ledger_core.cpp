@@ -51,6 +51,29 @@ PositionLedgerCore::market_position(internal::ExchangeId exchange,
     };
 }
 
+PortfolioRiskSnapshot PositionLedgerCore::portfolio_risk_snapshot(internal::ExchangeId exchange,
+                                                                  std::string_view market_ticker) const {
+    PortfolioRiskSnapshot snapshot{};
+
+    const auto market_it = positions_.find(MarketKey{
+        .exchange = exchange,
+        .market_ticker = std::string{market_ticker},
+    });
+    if (market_it != positions_.end()) {
+        snapshot.net_position_market = market_it->second.net_qty_lots;
+    }
+
+    for (const auto& [key, position] : positions_) {
+        if (key.exchange != exchange) {
+            continue;
+        }
+        snapshot.gross_position_global += abs_qty(position.net_qty_lots);
+        snapshot.realized_pnl_ticks_total += position.realized_pnl_ticks;
+    }
+
+    return snapshot;
+}
+
 PositionLedgerStats PositionLedgerCore::stats() const {
     std::size_t open_position_count = 0;
     for (const auto& [key, position] : positions_) {

@@ -9,6 +9,7 @@
 
 #include "trading/internal/oms_types.hpp"
 #include "trading/oms/global_risk_gate.hpp"
+#include "trading/oms/portfolio_risk_gate.hpp"
 
 namespace trading::oms {
 
@@ -39,6 +40,7 @@ struct InFlightOrderSnapshot {
 
 struct OrderManagerCoreStats {
     std::uint64_t risk_reject_count{0};
+    std::uint64_t portfolio_risk_reject_count{0};
     std::uint64_t transition_applied_count{0};
     std::uint64_t transition_reject_count{0};
     std::uint64_t unknown_order_update_count{0};
@@ -49,7 +51,8 @@ struct OrderManagerCoreStats {
 
 class OrderManagerCore final {
   public:
-    explicit OrderManagerCore(GlobalRiskConfig config = {});
+    explicit OrderManagerCore(GlobalRiskConfig global_risk_config = {},
+                              PortfolioRiskConfig portfolio_risk_config = {});
 
     void reset();
     [[nodiscard]] OrderManagerCoreStats stats() const;
@@ -65,6 +68,12 @@ class OrderManagerCore final {
     [[nodiscard]] static internal::OrderStateUpdate
     make_global_risk_reject_update(const internal::OrderIntent& intent,
                                    const GlobalRiskDecision& decision);
+    [[nodiscard]] std::optional<PortfolioRiskDecision>
+    evaluate_portfolio_risk(const internal::OrderIntent& intent,
+                            const PortfolioRiskSnapshot& snapshot, std::string& error_message);
+    [[nodiscard]] static internal::OrderStateUpdate
+    make_portfolio_risk_reject_update(const internal::OrderIntent& intent,
+                                      const PortfolioRiskDecision& decision);
 
     [[nodiscard]] bool apply_update_transition(internal::OrderStateUpdate& update,
                                                std::string& error_message);
@@ -95,10 +104,12 @@ class OrderManagerCore final {
     build_risk_snapshot(std::string_view market_ticker, std::string_view skip_client_order_id) const;
 
     GlobalRiskGate global_risk_gate_;
+    PortfolioRiskGate portfolio_risk_gate_;
     std::unordered_map<internal::ClientOrderId, InFlightOrder> in_flight_orders_;
     std::unordered_map<internal::ExchangeOrderId, internal::ClientOrderId> exchange_to_client_;
 
     std::uint64_t risk_reject_count_{0};
+    std::uint64_t portfolio_risk_reject_count_{0};
     std::uint64_t transition_applied_count_{0};
     std::uint64_t transition_reject_count_{0};
     std::uint64_t unknown_order_update_count_{0};

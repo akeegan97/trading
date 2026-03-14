@@ -15,6 +15,7 @@
 #include "trading/oms/exchange_adapter.hpp"
 #include "trading/oms/order_event_sink.hpp"
 #include "trading/oms/order_manager_core.hpp"
+#include "trading/oms/portfolio_risk_snapshot_provider.hpp"
 #include "trading/oms/transport.hpp"
 
 namespace trading::oms {
@@ -24,6 +25,8 @@ struct OrderManagerConfig {
 
     OrderTransportConfig transport;
     GlobalRiskConfig global_risk{};
+    PortfolioRiskConfig portfolio_risk{};
+    const IPortfolioRiskSnapshotProvider* portfolio_snapshot_provider{nullptr};
     std::chrono::milliseconds loop_idle_sleep{kDefaultLoopIdleSleep};
 };
 
@@ -32,6 +35,7 @@ struct OrderManagerStats {
     std::uint64_t sent_count{0};
     std::uint64_t send_failed_count{0};
     std::uint64_t risk_reject_count{0};
+    std::uint64_t portfolio_risk_reject_count{0};
     std::uint64_t receive_count{0};
     std::uint64_t parse_failed_count{0};
     std::uint64_t update_drop_count{0};

@@ -14,6 +14,12 @@ bool PositionLedger::on_order_update(const internal::OrderStateUpdate& update) {
     return result_ok;
 }
 
+PortfolioRiskSnapshot PositionLedger::snapshot_for(internal::ExchangeId exchange,
+                                                   std::string_view market_ticker) const {
+    std::scoped_lock lock{mutex_};
+    return core_.portfolio_risk_snapshot(exchange, market_ticker);
+}
+
 std::optional<PositionSnapshot> PositionLedger::market_position(internal::ExchangeId exchange,
                                                                 std::string_view market_ticker) const {
     std::scoped_lock lock{mutex_};

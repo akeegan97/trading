@@ -14,12 +14,15 @@ internal::TimestampNs to_timestamp_ns(std::chrono::steady_clock::time_point time
 }
 } // namespace
 
-OrderManagerCore::OrderManagerCore(GlobalRiskConfig config) : global_risk_gate_(config) {}
+OrderManagerCore::OrderManagerCore(GlobalRiskConfig global_risk_config,
+                                   PortfolioRiskConfig portfolio_risk_config)
+    : global_risk_gate_(global_risk_config), portfolio_risk_gate_(portfolio_risk_config) {}
 
 void OrderManagerCore::reset() {
     in_flight_orders_.clear();
     exchange_to_client_.clear();
     risk_reject_count_ = 0;
+    portfolio_risk_reject_count_ = 0;
     transition_applied_count_ = 0;
     transition_reject_count_ = 0;
     unknown_order_update_count_ = 0;
@@ -37,6 +40,7 @@ OrderManagerCoreStats OrderManagerCore::stats() const {
 
     return OrderManagerCoreStats{
         .risk_reject_count = risk_reject_count_,
+        .portfolio_risk_reject_count = portfolio_risk_reject_count_,
         .transition_applied_count = transition_applied_count_,
         .transition_reject_count = transition_reject_count_,
         .unknown_order_update_count = unknown_order_update_count_,
@@ -207,6 +211,20 @@ OrderManagerCore::evaluate_global_risk(const internal::OrderIntent& intent, std:
     return decision;
 }
 
+std::optional<PortfolioRiskDecision>
+OrderManagerCore::evaluate_portfolio_risk(const internal::OrderIntent& intent,
+                                          const PortfolioRiskSnapshot& snapshot,
+                                          std::string& error_message) {
+    auto decision = portfolio_risk_gate_.evaluate(intent, snapshot);
+    if (decision.allow) {
+        return std::nullopt;
+    }
+
+    ++portfolio_risk_reject_count_;
+    error_message = decision.reason_message;
+    return decision;
+}
+
 internal::OrderStateUpdate
 OrderManagerCore::make_global_risk_reject_update(const internal::OrderIntent& intent,
                                                  const GlobalRiskDecision& decision) {
@@ -222,6 +240,27 @@ OrderManagerCore::make_global_risk_reject_update(const internal::OrderIntent& in
                 .client_order_id = intent.client_order_id,
                 .exchange_order_id = std::nullopt,
                 .reason_code = std::string{GlobalRiskGate::reject_code_name(decision.code)},
+                .reason_message = decision.reason_message,
+            },
+        .raw_payload = {},
+    };
+}
+
+internal::OrderStateUpdate
+OrderManagerCore::make_portfolio_risk_reject_update(const internal::OrderIntent& intent,
+                                                    const PortfolioRiskDecision& decision) {
+    return internal::OrderStateUpdate{
+        .exchange = intent.exchange,
+        .status = internal::OmsOrderStatus::kRejected,
+        .client_order_id = intent.client_order_id,
+        .exchange_order_id = std::nullopt,
+        .market_ticker = intent.market_ticker,
+        .recv_ts_ns = monotonic_now_ns(),
+        .data =
+            internal::OrderReject{
+                .client_order_id = intent.client_order_id,
+                .exchange_order_id = std::nullopt,
+                .reason_code = std::string{PortfolioRiskGate::reject_code_name(decision.code)},
                 .reason_message = decision.reason_message,
             },
         .raw_payload = {},

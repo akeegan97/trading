@@ -6,13 +6,16 @@
 #include <string>
 
 #include "trading/oms/order_event_sink.hpp"
+#include "trading/oms/portfolio_risk_snapshot_provider.hpp"
 #include "trading/oms/position_ledger_core.hpp"
 
 namespace trading::oms {
 
-class PositionLedger final : public IOrderEventSink {
+class PositionLedger final : public IOrderEventSink, public IPortfolioRiskSnapshotProvider {
   public:
     bool on_order_update(const internal::OrderStateUpdate& update) override;
+    [[nodiscard]] PortfolioRiskSnapshot snapshot_for(internal::ExchangeId exchange,
+                                                     std::string_view market_ticker) const override;
 
     [[nodiscard]] std::optional<PositionSnapshot>
     market_position(internal::ExchangeId exchange, std::string_view market_ticker) const;

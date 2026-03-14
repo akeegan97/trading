@@ -18,7 +18,7 @@ internal::TimestampNs to_timestamp_ns(std::chrono::steady_clock::time_point time
 OrderManager::OrderManager(const IExchangeOmsAdapter& adapter, IOrderTransport& transport,
                            IOrderEventSink& event_sink, OrderManagerConfig config)
     : adapter_(adapter), transport_(transport), event_sink_(event_sink), config_(std::move(config)),
-      core_(config_.global_risk) {}
+      core_(config_.global_risk, config_.portfolio_risk) {}
 
 OrderManager::~OrderManager() { stop(); }
 
@@ -121,6 +121,7 @@ OrderManagerStats OrderManager::stats() const {
         .sent_count = sent_count_.load(std::memory_order_relaxed),
         .send_failed_count = send_failed_count_.load(std::memory_order_relaxed),
         .risk_reject_count = core_stats.risk_reject_count,
+        .portfolio_risk_reject_count = core_stats.portfolio_risk_reject_count,
         .receive_count = receive_count_.load(std::memory_order_relaxed),
         .parse_failed_count = parse_failed_count_.load(std::memory_order_relaxed),
         .update_drop_count = update_drop_count_.load(std::memory_order_relaxed),
@@ -163,6 +164,7 @@ void OrderManager::run(const std::stop_token& stop_token) {
     running_.store(false, std::memory_order_release);
 }
 
+// NOLINTBEGIN(readability-function-cognitive-complexity)
 std::size_t OrderManager::drain_outbound_intents() {
     std::deque<PendingIntent> local_intents;
     {
@@ -201,6 +203,34 @@ std::size_t OrderManager::drain_outbound_intents() {
             continue;
         }
 
+        if (config_.portfolio_snapshot_provider != nullptr) {
+            const auto snapshot = config_.portfolio_snapshot_provider->snapshot_for(
+                pending_intent.intent.exchange, pending_intent.intent.market_ticker);
+            {
+                std::scoped_lock core_lock{core_mutex_};
+                const auto decision =
+                    core_.evaluate_portfolio_risk(pending_intent.intent, snapshot, core_error);
+                if (decision.has_value()) {
+                    risk_reject_update =
+                        OrderManagerCore::make_portfolio_risk_reject_update(pending_intent.intent,
+                                                                             *decision);
+                    if (!core_.apply_update_transition(*risk_reject_update, core_error)) {
+                        update_drop_count_.fetch_add(1, std::memory_order_relaxed);
+                        set_error(core_error);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if (risk_reject_update.has_value()) {
+            set_error(core_error);
+            if (!event_sink_.on_order_update(*risk_reject_update)) {
+                update_drop_count_.fetch_add(1, std::memory_order_relaxed);
+            }
+            continue;
+        }
+
         try {
             const std::string payload = adapter_.build_request(pending_intent.intent);
             if (!transport_.send_text(payload)) {
@@ -220,6 +250,7 @@ std::size_t OrderManager::drain_outbound_intents() {
 
     return processed_count;
 }
+// NOLINTEND(readability-function-cognitive-complexity)
 
 bool OrderManager::pump_incoming_update() {
     auto payload = transport_.recv_text();
