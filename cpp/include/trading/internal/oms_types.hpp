@@ -77,6 +77,7 @@ struct OrderFill {
     std::string market_ticker;
     QtyLots fill_qty_lots{0};
     PriceTicks fill_price_ticks{0};
+    Side side{Side::kUnknown};
     OmsLiquidity liquidity{OmsLiquidity::kUnknown};
 };
 

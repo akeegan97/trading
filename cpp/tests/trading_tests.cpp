@@ -26,6 +26,7 @@
 #include "trading/internal/router_frame.hpp"
 #include "trading/oms/global_risk_gate.hpp"
 #include "trading/oms/order_manager.hpp"
+#include "trading/oms/position_ledger.hpp"
 #include "trading/parsers/exchanges/kalshi/parser.hpp"
 #include "trading/pipeline/live_pipeline.hpp"
 #include "trading/router/router.hpp"
@@ -175,6 +176,33 @@ const trading::internal::OrderStateUpdate& require_order_update(
         return kEmpty;
     }
     return *parsed_value;
+}
+
+trading::internal::OrderStateUpdate make_fill_update(
+    trading::internal::ExchangeId exchange, std::string market_ticker,
+    std::string client_order_id, trading::internal::Side side,
+    trading::internal::QtyLots fill_qty_lots, trading::internal::PriceTicks fill_price_ticks,
+    trading::internal::TimestampNs recv_ts_ns = 1) {
+    const std::string fill_client_order_id = client_order_id;
+    return trading::internal::OrderStateUpdate{
+        .exchange = exchange,
+        .status = trading::internal::OmsOrderStatus::kFilled,
+        .client_order_id = std::move(client_order_id),
+        .exchange_order_id = std::nullopt,
+        .market_ticker = market_ticker,
+        .recv_ts_ns = recv_ts_ns,
+        .data =
+            trading::internal::OrderFill{
+                .client_order_id = fill_client_order_id,
+                .exchange_order_id = std::nullopt,
+                .market_ticker = std::move(market_ticker),
+                .fill_qty_lots = fill_qty_lots,
+                .fill_price_ticks = fill_price_ticks,
+                .side = side,
+                .liquidity = trading::internal::OmsLiquidity::kUnknown,
+            },
+        .raw_payload = {},
+    };
 }
 
 trading::internal::NormalizedEvent
@@ -548,6 +576,29 @@ TEST(KalshiOmsAdapterTest, ParsesFillUpdate) {
     ASSERT_NE(fill_data, nullptr);
     EXPECT_EQ(fill_data->fill_qty_lots, 3);
     EXPECT_EQ(fill_data->fill_price_ticks, 41);
+    EXPECT_EQ(fill_data->side, trading::internal::Side::kUnknown);
+}
+
+TEST(KalshiOmsAdapterTest, ParsesFillUpdateWithSide) {
+    constexpr std::string_view kFillPayload = R"({
+        "type": "fill",
+        "recv_ts_ns": 24,
+        "msg": {
+            "client_order_id": "cl-104",
+            "exchange_order_id": "ex-203",
+            "market_ticker": "KXBTC-YES",
+            "fill_qty": 2,
+            "fill_price": 49,
+            "side": "sell"
+        }
+    })";
+
+    const trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    const auto fill = adapter.parse_update(kFillPayload);
+    const auto& fill_update = require_order_update(fill);
+    const auto* fill_data = std::get_if<trading::internal::OrderFill>(&fill_update.data);
+    ASSERT_NE(fill_data, nullptr);
+    EXPECT_EQ(fill_data->side, trading::internal::Side::kSell);
 }
 
 TEST(KalshiOmsAdapterTest, RejectsUnsupportedUpdateType) {
@@ -789,6 +840,64 @@ TEST(OrderManagerTest, TracksInFlightOrderAcrossAcceptedThenFilledTransitions) {
     EXPECT_EQ(stats.update_drop_count, 0U);
     EXPECT_EQ(stats.tracked_order_count, 1U);
     EXPECT_EQ(stats.active_order_count, 0U);
+}
+
+TEST(OrderManagerTest, EnrichesFillSideFromTrackedIntent) {
+    constexpr std::string_view kInboundFill = R"({
+        "type": "fill",
+        "recv_ts_ns": 210,
+        "msg": {
+            "client_order_id": "cl-side-1",
+            "exchange_order_id": "ex-side-1",
+            "market_ticker": "KXBTC-YES",
+            "fill_qty": 5,
+            "fill_price": 47
+        }
+    })";
+
+    trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    FakeOmsTransport transport;
+    CollectingOrderEventSink event_sink;
+    trading::oms::OrderManager manager{
+        adapter,
+        transport,
+        event_sink,
+        trading::oms::OrderManagerConfig{
+            .transport =
+                trading::oms::OrderTransportConfig{
+                    .endpoint = "wss://example.test/orders",
+                },
+            .loop_idle_sleep = std::chrono::milliseconds{1},
+        },
+    };
+    ASSERT_TRUE(manager.start());
+    ASSERT_TRUE(manager
+                    .submit(trading::internal::OrderIntent{
+                        .exchange = trading::internal::ExchangeId::kKalshi,
+                        .action = trading::internal::OmsAction::kPlace,
+                        .client_order_id = "cl-side-1",
+                        .market_ticker = "KXBTC-YES",
+                        .side = trading::internal::Side::kBuy,
+                        .qty_lots = 5,
+                        .limit_price_ticks = 47,
+                        .time_in_force = trading::internal::OmsTimeInForce::kGtc,
+                    })
+                    .has_value());
+
+    transport.queue_inbound(std::string{kInboundFill});
+    ASSERT_TRUE(wait_until([&event_sink] { return event_sink.update_count() == 1; },
+                           std::chrono::milliseconds{100}));
+
+    const auto update = event_sink.last_update();
+    if (!update.has_value()) {
+        GTEST_FAIL() << "expected fill update";
+        return;
+    }
+    const auto* fill = std::get_if<trading::internal::OrderFill>(&update.value().data);
+    ASSERT_NE(fill, nullptr);
+    EXPECT_EQ(fill->side, trading::internal::Side::kBuy);
+
+    manager.stop();
 }
 
 TEST(OrderManagerTest, RejectsOutOfOrderTransitionFromFilledBackToAccepted) {
@@ -1387,6 +1496,110 @@ TEST(OrderManagerTest, StartFailsWhenTransportConnectFails) {
     EXPECT_FALSE(manager.start());
     EXPECT_FALSE(manager.running());
     EXPECT_EQ(manager.last_error(), "connect failed");
+}
+
+// NOLINTBEGIN(readability-function-cognitive-complexity)
+TEST(PositionLedgerTest, TracksOpenPositionAndAveragePriceForSameDirectionFills) {
+    trading::oms::PositionLedger ledger;
+
+    EXPECT_TRUE(ledger.on_order_update(make_fill_update(
+        trading::internal::ExchangeId::kKalshi, "KXBTC-YES", "cl-pos-1",
+        trading::internal::Side::kBuy, 10, 40, 100)));
+    EXPECT_TRUE(ledger.on_order_update(make_fill_update(
+        trading::internal::ExchangeId::kKalshi, "KXBTC-YES", "cl-pos-2",
+        trading::internal::Side::kBuy, 5, 55, 101)));
+
+    const auto snapshot =
+        ledger.market_position(trading::internal::ExchangeId::kKalshi, "KXBTC-YES");
+    if (!snapshot.has_value()) {
+        GTEST_FAIL() << "expected position snapshot";
+        return;
+    }
+    const trading::oms::PositionSnapshot& position = *snapshot;
+    EXPECT_EQ(position.net_qty_lots, 15);
+    EXPECT_EQ(position.avg_open_price_ticks.value_or(0), 45);
+    EXPECT_EQ(position.bought_qty_lots, 15);
+    EXPECT_EQ(position.sold_qty_lots, 0);
+    EXPECT_EQ(position.realized_pnl_ticks, 0);
+
+    const auto stats = ledger.stats();
+    EXPECT_EQ(stats.processed_fill_count, 2U);
+    EXPECT_EQ(stats.open_position_count, 1U);
+    EXPECT_EQ(stats.closed_position_count, 0U);
+}
+
+TEST(PositionLedgerTest, RealizesPnlOnCloseAndFlipTransitions) {
+    trading::oms::PositionLedger ledger;
+
+    EXPECT_TRUE(ledger.on_order_update(make_fill_update(
+        trading::internal::ExchangeId::kKalshi, "KXBTC-YES", "cl-r1",
+        trading::internal::Side::kBuy, 10, 40, 200)));
+    EXPECT_TRUE(ledger.on_order_update(make_fill_update(
+        trading::internal::ExchangeId::kKalshi, "KXBTC-YES", "cl-r2",
+        trading::internal::Side::kSell, 4, 55, 201)));
+    EXPECT_TRUE(ledger.on_order_update(make_fill_update(
+        trading::internal::ExchangeId::kKalshi, "KXBTC-YES", "cl-r3",
+        trading::internal::Side::kSell, 10, 30, 202)));
+    EXPECT_TRUE(ledger.on_order_update(make_fill_update(
+        trading::internal::ExchangeId::kKalshi, "KXBTC-YES", "cl-r4",
+        trading::internal::Side::kBuy, 4, 20, 203)));
+
+    const auto snapshot =
+        ledger.market_position(trading::internal::ExchangeId::kKalshi, "KXBTC-YES");
+    if (!snapshot.has_value()) {
+        GTEST_FAIL() << "expected position snapshot";
+        return;
+    }
+    const trading::oms::PositionSnapshot& position = *snapshot;
+    EXPECT_EQ(position.net_qty_lots, 0);
+    EXPECT_FALSE(position.avg_open_price_ticks.has_value());
+    EXPECT_EQ(position.realized_pnl_ticks, 40);
+    EXPECT_EQ(position.closed_qty_lots, 14);
+
+    const auto stats = ledger.stats();
+    EXPECT_EQ(stats.processed_fill_count, 4U);
+    EXPECT_EQ(stats.realized_pnl_ticks_total, 40);
+    EXPECT_EQ(stats.open_position_count, 0U);
+    EXPECT_EQ(stats.closed_position_count, 1U);
+}
+// NOLINTEND(readability-function-cognitive-complexity)
+
+TEST(PositionLedgerTest, RejectsUnknownSideOnFill) {
+    trading::oms::PositionLedger ledger;
+
+    EXPECT_FALSE(ledger.on_order_update(make_fill_update(
+        trading::internal::ExchangeId::kKalshi, "KXBTC-YES", "cl-bad-side",
+        trading::internal::Side::kUnknown, 1, 45, 300)));
+
+    const auto stats = ledger.stats();
+    EXPECT_EQ(stats.processed_fill_count, 0U);
+    EXPECT_EQ(stats.rejected_fill_count, 1U);
+    EXPECT_EQ(ledger.last_error(), "Fill update has unknown side");
+}
+
+TEST(PositionLedgerTest, IgnoresNonFillUpdates) {
+    trading::oms::PositionLedger ledger;
+    const trading::internal::OrderStateUpdate ack{
+        .exchange = trading::internal::ExchangeId::kKalshi,
+        .status = trading::internal::OmsOrderStatus::kAccepted,
+        .client_order_id = "cl-ack-1",
+        .exchange_order_id = std::nullopt,
+        .market_ticker = "KXBTC-YES",
+        .recv_ts_ns = 400,
+        .data =
+            trading::internal::OrderAck{
+                .client_order_id = "cl-ack-1",
+                .exchange_order_id = std::nullopt,
+                .market_ticker = "KXBTC-YES",
+                .accepted_qty_lots = 1,
+            },
+        .raw_payload = {},
+    };
+
+    EXPECT_TRUE(ledger.on_order_update(ack));
+    const auto stats = ledger.stats();
+    EXPECT_EQ(stats.processed_fill_count, 0U);
+    EXPECT_EQ(stats.ignored_update_count, 1U);
 }
 
 TEST(WsSessionTest, ConnectBuildsKalshiHeaders) {

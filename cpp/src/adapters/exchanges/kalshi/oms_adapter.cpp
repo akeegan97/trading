@@ -38,6 +38,22 @@ std::string side_to_string(internal::Side side) {
     return "unknown";
 }
 
+std::optional<internal::Side> side_from_string(std::string_view side) {
+    if (side == "buy") {
+        return internal::Side::kBuy;
+    }
+    if (side == "sell") {
+        return internal::Side::kSell;
+    }
+    if (side == "bid") {
+        return internal::Side::kBid;
+    }
+    if (side == "ask") {
+        return internal::Side::kAsk;
+    }
+    return std::nullopt;
+}
+
 std::string tif_to_string(internal::OmsTimeInForce tif) {
     switch (tif) {
     case internal::OmsTimeInForce::kGtc:
@@ -75,6 +91,14 @@ std::optional<internal::PriceTicks> try_get_price(const nlohmann::json& object,
         return std::nullopt;
     }
     return field_it->get<internal::PriceTicks>();
+}
+
+std::optional<internal::Side> try_get_side(const nlohmann::json& object, std::string_view key) {
+    const auto side_value = try_get_string(object, key);
+    if (!side_value.has_value()) {
+        return std::nullopt;
+    }
+    return side_from_string(*side_value);
 }
 
 oms::ParseResult<internal::OrderStateUpdate>
@@ -164,6 +188,7 @@ oms::ParseResult<internal::OrderStateUpdate> parse_fill(const nlohmann::json& ro
                 .market_ticker = *market_ticker,
                 .fill_qty_lots = *fill_qty,
                 .fill_price_ticks = *fill_price,
+                .side = try_get_side(message, "side").value_or(internal::Side::kUnknown),
                 .liquidity = internal::OmsLiquidity::kUnknown,
             },
         .raw_payload = std::string{raw_payload},
