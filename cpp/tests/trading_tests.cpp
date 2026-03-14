@@ -26,6 +26,7 @@
 #include "trading/internal/router_frame.hpp"
 #include "trading/oms/global_risk_gate.hpp"
 #include "trading/oms/order_manager.hpp"
+#include "trading/oms/portfolio_risk_gate.hpp"
 #include "trading/oms/position_ledger.hpp"
 #include "trading/parsers/exchanges/kalshi/parser.hpp"
 #include "trading/pipeline/live_pipeline.hpp"
@@ -657,6 +658,118 @@ TEST(GlobalRiskGateTest, AllowsCancelEvenWhenLimitsWouldRejectPlace) {
 
     EXPECT_TRUE(decision.allow);
     EXPECT_EQ(decision.code, trading::oms::GlobalRiskRejectCode::kNone);
+}
+
+TEST(PortfolioRiskGateTest, RejectsWhenMarketAbsPositionLimitExceeded) {
+    const trading::oms::PortfolioRiskGate gate{
+        trading::oms::PortfolioRiskConfig{
+            .max_abs_net_position_per_market = 10,
+        },
+    };
+
+    const auto decision = gate.evaluate(
+        trading::internal::OrderIntent{
+            .exchange = trading::internal::ExchangeId::kKalshi,
+            .action = trading::internal::OmsAction::kPlace,
+            .side = trading::internal::Side::kBuy,
+            .qty_lots = 3,
+        },
+        trading::oms::PortfolioRiskSnapshot{
+            .net_position_market = 9,
+            .gross_position_global = 20,
+        });
+
+    EXPECT_FALSE(decision.allow);
+    EXPECT_EQ(decision.code, trading::oms::PortfolioRiskRejectCode::kAbsNetPositionMarketLimit);
+}
+
+TEST(PortfolioRiskGateTest, RejectsWhenGrossGlobalLimitExceeded) {
+    const trading::oms::PortfolioRiskGate gate{
+        trading::oms::PortfolioRiskConfig{
+            .max_abs_position_gross_global = 50,
+        },
+    };
+
+    const auto decision = gate.evaluate(
+        trading::internal::OrderIntent{
+            .exchange = trading::internal::ExchangeId::kKalshi,
+            .action = trading::internal::OmsAction::kPlace,
+            .side = trading::internal::Side::kBuy,
+            .qty_lots = 4,
+        },
+        trading::oms::PortfolioRiskSnapshot{
+            .net_position_market = 10,
+            .gross_position_global = 49,
+        });
+
+    EXPECT_FALSE(decision.allow);
+    EXPECT_EQ(decision.code, trading::oms::PortfolioRiskRejectCode::kAbsPositionGrossGlobalLimit);
+}
+
+TEST(PortfolioRiskGateTest, RejectsWhenRealizedPnlFloorBreached) {
+    const trading::oms::PortfolioRiskGate gate{
+        trading::oms::PortfolioRiskConfig{
+            .min_realized_pnl_ticks = -100,
+            .enforce_realized_pnl_floor = true,
+        },
+    };
+
+    const auto decision = gate.evaluate(
+        trading::internal::OrderIntent{
+            .exchange = trading::internal::ExchangeId::kKalshi,
+            .action = trading::internal::OmsAction::kPlace,
+            .side = trading::internal::Side::kSell,
+            .qty_lots = 1,
+        },
+        trading::oms::PortfolioRiskSnapshot{
+            .realized_pnl_ticks_total = -101,
+        });
+
+    EXPECT_FALSE(decision.allow);
+    EXPECT_EQ(decision.code, trading::oms::PortfolioRiskRejectCode::kRealizedPnlFloor);
+}
+
+TEST(PortfolioRiskGateTest, AllowsCancelRegardlessOfLimits) {
+    const trading::oms::PortfolioRiskGate gate{
+        trading::oms::PortfolioRiskConfig{
+            .max_abs_net_position_per_market = 1,
+            .max_abs_position_gross_global = 1,
+            .min_realized_pnl_ticks = -10,
+            .enforce_realized_pnl_floor = true,
+        },
+    };
+
+    const auto decision = gate.evaluate(
+        trading::internal::OrderIntent{
+            .exchange = trading::internal::ExchangeId::kKalshi,
+            .action = trading::internal::OmsAction::kCancel,
+            .side = trading::internal::Side::kUnknown,
+            .qty_lots = 0,
+        },
+        trading::oms::PortfolioRiskSnapshot{
+            .net_position_market = 100,
+            .gross_position_global = 1'000,
+            .realized_pnl_ticks_total = -1'000,
+        });
+
+    EXPECT_TRUE(decision.allow);
+    EXPECT_EQ(decision.code, trading::oms::PortfolioRiskRejectCode::kNone);
+}
+
+TEST(PortfolioRiskGateTest, RejectsInvalidIntentSideOrQty) {
+    const trading::oms::PortfolioRiskGate gate{};
+
+    const auto decision = gate.evaluate(
+        trading::internal::OrderIntent{
+            .exchange = trading::internal::ExchangeId::kKalshi,
+            .action = trading::internal::OmsAction::kPlace,
+            .side = trading::internal::Side::kUnknown,
+            .qty_lots = 3,
+        },
+        trading::oms::PortfolioRiskSnapshot{});
+
+    EXPECT_FALSE(decision.allow);
+    EXPECT_EQ(decision.code, trading::oms::PortfolioRiskRejectCode::kInvalidIntent);
 }
 
 TEST(OrderManagerTest, SendsIntentToTransport) {
