@@ -10,12 +10,11 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_map>
 
 #include "trading/internal/oms_types.hpp"
 #include "trading/oms/exchange_adapter.hpp"
-#include "trading/oms/global_risk_gate.hpp"
 #include "trading/oms/order_event_sink.hpp"
+#include "trading/oms/order_manager_core.hpp"
 #include "trading/oms/transport.hpp"
 
 namespace trading::oms {
@@ -44,31 +43,6 @@ struct OrderManagerStats {
     std::size_t pending_intent_count{0};
     std::size_t tracked_order_count{0};
     std::size_t active_order_count{0};
-};
-
-enum class InFlightStatus : std::uint8_t {
-    kPending = 0,
-    kAccepted = 1,
-    kPartiallyFilled = 2,
-    kFilled = 3,
-    kCanceled = 4,
-    kRejected = 5,
-    kReplaced = 6,
-};
-
-struct InFlightOrderSnapshot {
-    internal::OrderRequestId request_id{0};
-    internal::OmsAction last_action{internal::OmsAction::kUnknown};
-    InFlightStatus status{InFlightStatus::kPending};
-    internal::ClientOrderId client_order_id;
-    std::optional<internal::ExchangeOrderId> exchange_order_id;
-    std::optional<internal::ClientOrderId> replace_target_client_order_id;
-    std::string market_ticker;
-    internal::Side side{internal::Side::kUnknown};
-    internal::QtyLots requested_qty_lots{0};
-    internal::QtyLots filled_qty_lots{0};
-    internal::TimestampNs created_ts_ns{0};
-    internal::TimestampNs last_update_ts_ns{0};
 };
 
 class OrderManager final {
@@ -114,39 +88,21 @@ class OrderManager final {
     };
 
     static internal::TimestampNs monotonic_now_ns();
-    [[nodiscard]] static bool is_terminal_state(InFlightStatus status);
-    [[nodiscard]] static std::optional<InFlightStatus>
-    to_in_flight_status(internal::OmsOrderStatus status);
-    [[nodiscard]] static bool can_transition(InFlightStatus current, InFlightStatus next);
-
     void run(const std::stop_token& stop_token);
     [[nodiscard]] std::size_t drain_outbound_intents();
     [[nodiscard]] bool pump_incoming_update();
-    [[nodiscard]] bool validate_and_track_submission(internal::OrderRequestId request_id,
-                                                     const internal::OrderIntent& intent,
-                                                     std::string& error_message);
-    [[nodiscard]] bool apply_update_transition(internal::OrderStateUpdate& update);
-    [[nodiscard]] GlobalRiskSnapshot
-    build_risk_snapshot(std::string_view market_ticker,
-                        std::string_view skip_client_order_id) const;
-    [[nodiscard]] static internal::QtyLots outstanding_qty(const InFlightOrder& order);
-    void emit_global_risk_reject(const PendingIntent& pending_intent,
-                                 const GlobalRiskDecision& decision);
     void set_error(std::string_view error_message);
 
     const IExchangeOmsAdapter& adapter_;
     IOrderTransport& transport_;
     IOrderEventSink& event_sink_;
     OrderManagerConfig config_;
-    GlobalRiskGate global_risk_gate_;
+    mutable std::mutex core_mutex_;
+    OrderManagerCore core_;
 
     std::jthread worker_;
     mutable std::mutex queue_mutex_;
     std::deque<PendingIntent> outbound_queue_;
-
-    mutable std::mutex in_flight_mutex_;
-    std::unordered_map<internal::ClientOrderId, InFlightOrder> in_flight_orders_;
-    std::unordered_map<internal::ExchangeOrderId, internal::ClientOrderId> exchange_to_client_;
 
     mutable std::mutex error_mutex_;
     std::string last_error_;
@@ -156,14 +112,9 @@ class OrderManager final {
     std::atomic<std::uint64_t> submitted_count_{0};
     std::atomic<std::uint64_t> sent_count_{0};
     std::atomic<std::uint64_t> send_failed_count_{0};
-    std::atomic<std::uint64_t> risk_reject_count_{0};
     std::atomic<std::uint64_t> receive_count_{0};
     std::atomic<std::uint64_t> parse_failed_count_{0};
     std::atomic<std::uint64_t> update_drop_count_{0};
-    std::atomic<std::uint64_t> transition_applied_count_{0};
-    std::atomic<std::uint64_t> transition_reject_count_{0};
-    std::atomic<std::uint64_t> unknown_order_update_count_{0};
-    std::atomic<std::uint64_t> policy_reject_count_{0};
     std::atomic<std::uint64_t> unsupported_intent_count_{0};
 };
 
