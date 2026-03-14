@@ -32,7 +32,10 @@ target_link_libraries(trading_adapters_oms PUBLIC nlohmann_json::nlohmann_json)
 add_library(
   trading_oms_runtime
   src/oms/global_risk_gate.cpp
+  src/oms/order_manager_core.cpp
   src/oms/order_manager.cpp
+  src/oms/portfolio_risk_gate.cpp
+  src/oms/position_ledger_core.cpp
   src/oms/position_ledger.cpp
 )
 target_include_directories(trading_oms_runtime PUBLIC include)

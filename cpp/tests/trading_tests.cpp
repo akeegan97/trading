@@ -26,6 +26,7 @@
 #include "trading/internal/router_frame.hpp"
 #include "trading/oms/global_risk_gate.hpp"
 #include "trading/oms/order_manager.hpp"
+#include "trading/oms/portfolio_risk_gate.hpp"
 #include "trading/oms/position_ledger.hpp"
 #include "trading/parsers/exchanges/kalshi/parser.hpp"
 #include "trading/pipeline/live_pipeline.hpp"
@@ -400,6 +401,27 @@ class CollectingOrderEventSink final : public trading::oms::IOrderEventSink {
     std::vector<trading::internal::OrderStateUpdate> updates_;
 };
 
+class FixedPortfolioRiskSnapshotProvider final
+    : public trading::oms::IPortfolioRiskSnapshotProvider {
+  public:
+    void set_snapshot(const trading::oms::PortfolioRiskSnapshot& snapshot) {
+        std::scoped_lock lock{mutex_};
+        snapshot_ = snapshot;
+    }
+
+    [[nodiscard]] trading::oms::PortfolioRiskSnapshot
+    snapshot_for(trading::internal::ExchangeId exchange, std::string_view market_ticker) const override {
+        static_cast<void>(exchange);
+        static_cast<void>(market_ticker);
+        std::scoped_lock lock{mutex_};
+        return snapshot_;
+    }
+
+  private:
+    mutable std::mutex mutex_;
+    trading::oms::PortfolioRiskSnapshot snapshot_{};
+};
+
 TEST(TradingCoreTest, StartupPayloadHasExpectedFields) {
     const auto startup = trading::engine::build_trader_startup_payload("test");
     const auto startup_json = nlohmann::json::parse(startup);
@@ -657,6 +679,118 @@ TEST(GlobalRiskGateTest, AllowsCancelEvenWhenLimitsWouldRejectPlace) {
 
     EXPECT_TRUE(decision.allow);
     EXPECT_EQ(decision.code, trading::oms::GlobalRiskRejectCode::kNone);
+}
+
+TEST(PortfolioRiskGateTest, RejectsWhenMarketAbsPositionLimitExceeded) {
+    const trading::oms::PortfolioRiskGate gate{
+        trading::oms::PortfolioRiskConfig{
+            .max_abs_net_position_per_market = 10,
+        },
+    };
+
+    const auto decision = gate.evaluate(
+        trading::internal::OrderIntent{
+            .exchange = trading::internal::ExchangeId::kKalshi,
+            .action = trading::internal::OmsAction::kPlace,
+            .side = trading::internal::Side::kBuy,
+            .qty_lots = 3,
+        },
+        trading::oms::PortfolioRiskSnapshot{
+            .net_position_market = 9,
+            .gross_position_global = 20,
+        });
+
+    EXPECT_FALSE(decision.allow);
+    EXPECT_EQ(decision.code, trading::oms::PortfolioRiskRejectCode::kAbsNetPositionMarketLimit);
+}
+
+TEST(PortfolioRiskGateTest, RejectsWhenGrossGlobalLimitExceeded) {
+    const trading::oms::PortfolioRiskGate gate{
+        trading::oms::PortfolioRiskConfig{
+            .max_abs_position_gross_global = 50,
+        },
+    };
+
+    const auto decision = gate.evaluate(
+        trading::internal::OrderIntent{
+            .exchange = trading::internal::ExchangeId::kKalshi,
+            .action = trading::internal::OmsAction::kPlace,
+            .side = trading::internal::Side::kBuy,
+            .qty_lots = 4,
+        },
+        trading::oms::PortfolioRiskSnapshot{
+            .net_position_market = 10,
+            .gross_position_global = 49,
+        });
+
+    EXPECT_FALSE(decision.allow);
+    EXPECT_EQ(decision.code, trading::oms::PortfolioRiskRejectCode::kAbsPositionGrossGlobalLimit);
+}
+
+TEST(PortfolioRiskGateTest, RejectsWhenRealizedPnlFloorBreached) {
+    const trading::oms::PortfolioRiskGate gate{
+        trading::oms::PortfolioRiskConfig{
+            .min_realized_pnl_ticks = -100,
+            .enforce_realized_pnl_floor = true,
+        },
+    };
+
+    const auto decision = gate.evaluate(
+        trading::internal::OrderIntent{
+            .exchange = trading::internal::ExchangeId::kKalshi,
+            .action = trading::internal::OmsAction::kPlace,
+            .side = trading::internal::Side::kSell,
+            .qty_lots = 1,
+        },
+        trading::oms::PortfolioRiskSnapshot{
+            .realized_pnl_ticks_total = -101,
+        });
+
+    EXPECT_FALSE(decision.allow);
+    EXPECT_EQ(decision.code, trading::oms::PortfolioRiskRejectCode::kRealizedPnlFloor);
+}
+
+TEST(PortfolioRiskGateTest, AllowsCancelRegardlessOfLimits) {
+    const trading::oms::PortfolioRiskGate gate{
+        trading::oms::PortfolioRiskConfig{
+            .max_abs_net_position_per_market = 1,
+            .max_abs_position_gross_global = 1,
+            .min_realized_pnl_ticks = -10,
+            .enforce_realized_pnl_floor = true,
+        },
+    };
+
+    const auto decision = gate.evaluate(
+        trading::internal::OrderIntent{
+            .exchange = trading::internal::ExchangeId::kKalshi,
+            .action = trading::internal::OmsAction::kCancel,
+            .side = trading::internal::Side::kUnknown,
+            .qty_lots = 0,
+        },
+        trading::oms::PortfolioRiskSnapshot{
+            .net_position_market = 100,
+            .gross_position_global = 1'000,
+            .realized_pnl_ticks_total = -1'000,
+        });
+
+    EXPECT_TRUE(decision.allow);
+    EXPECT_EQ(decision.code, trading::oms::PortfolioRiskRejectCode::kNone);
+}
+
+TEST(PortfolioRiskGateTest, RejectsInvalidIntentSideOrQty) {
+    const trading::oms::PortfolioRiskGate gate{};
+
+    const auto decision = gate.evaluate(
+        trading::internal::OrderIntent{
+            .exchange = trading::internal::ExchangeId::kKalshi,
+            .action = trading::internal::OmsAction::kPlace,
+            .side = trading::internal::Side::kUnknown,
+            .qty_lots = 3,
+        },
+        trading::oms::PortfolioRiskSnapshot{});
+
+    EXPECT_FALSE(decision.allow);
+    EXPECT_EQ(decision.code, trading::oms::PortfolioRiskRejectCode::kInvalidIntent);
 }
 
 TEST(OrderManagerTest, SendsIntentToTransport) {
@@ -1444,6 +1578,189 @@ TEST(OrderManagerTest, CancelBypassesGlobalRiskLimits) {
     EXPECT_EQ(stats.risk_reject_count, 0U);
 }
 
+TEST(OrderManagerTest, EmitsRiskRejectAndSkipsSendWhenPortfolioRiskTrips) {
+    constexpr trading::internal::QtyLots kMaxAbsNetPositionPerMarket = 5;
+    constexpr trading::internal::QtyLots kInitialNetPositionMarket = 5;
+    constexpr trading::internal::QtyLots kInitialGrossPositionGlobal = 5;
+
+    trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    FakeOmsTransport transport;
+    CollectingOrderEventSink event_sink;
+    FixedPortfolioRiskSnapshotProvider snapshot_provider;
+    snapshot_provider.set_snapshot(trading::oms::PortfolioRiskSnapshot{
+        .net_position_market = kInitialNetPositionMarket,
+        .gross_position_global = kInitialGrossPositionGlobal,
+        .realized_pnl_ticks_total = 0,
+    });
+    trading::oms::OrderManager manager{
+        adapter,
+        transport,
+        event_sink,
+        trading::oms::OrderManagerConfig{
+            .transport =
+                trading::oms::OrderTransportConfig{
+                    .endpoint = "wss://example.test/orders",
+                },
+            .portfolio_risk =
+                trading::oms::PortfolioRiskConfig{
+                    .max_abs_net_position_per_market = kMaxAbsNetPositionPerMarket,
+                },
+            .portfolio_snapshot_provider = &snapshot_provider,
+            .loop_idle_sleep = std::chrono::milliseconds{1},
+        },
+    };
+    ASSERT_TRUE(manager.start());
+
+    ASSERT_TRUE(manager
+                    .submit(trading::internal::OrderIntent{
+                        .exchange = trading::internal::ExchangeId::kKalshi,
+                        .action = trading::internal::OmsAction::kPlace,
+                        .client_order_id = "cl-portfolio-risk-1",
+                        .market_ticker = "KXBTC-YES",
+                        .side = trading::internal::Side::kBuy,
+                        .qty_lots = 1,
+                        .limit_price_ticks = 40,
+                        .time_in_force = trading::internal::OmsTimeInForce::kGtc,
+                    })
+                    .has_value());
+
+    ASSERT_TRUE(wait_until([&manager] { return manager.stats().portfolio_risk_reject_count == 1U; },
+                           std::chrono::milliseconds{100}));
+    ASSERT_TRUE(wait_until([&event_sink] { return event_sink.update_count() == 1U; },
+                           std::chrono::milliseconds{100}));
+
+    manager.stop();
+    EXPECT_EQ(transport.sent_count(), 0U);
+
+    const auto snapshot = manager.in_flight_order("cl-portfolio-risk-1");
+    ASSERT_TRUE(snapshot.has_value());
+    EXPECT_EQ(snapshot.value_or(trading::oms::InFlightOrderSnapshot{}).status,
+              trading::oms::InFlightStatus::kRejected);
+
+    const auto update_value =
+        event_sink.last_update().value_or(trading::internal::OrderStateUpdate{});
+    EXPECT_EQ(update_value.status, trading::internal::OmsOrderStatus::kRejected);
+    const auto* reject_data = std::get_if<trading::internal::OrderReject>(&update_value.data);
+    ASSERT_NE(reject_data, nullptr);
+    EXPECT_EQ(reject_data->reason_code, "abs_net_position_market_limit");
+
+    const auto stats = manager.stats();
+    EXPECT_EQ(stats.sent_count, 0U);
+    EXPECT_EQ(stats.risk_reject_count, 0U);
+    EXPECT_EQ(stats.portfolio_risk_reject_count, 1U);
+}
+
+TEST(OrderManagerTest, SendsIntentWhenPortfolioRiskAllows) {
+    constexpr trading::internal::QtyLots kInitialNetPositionMarket = 2;
+    constexpr trading::internal::QtyLots kInitialGrossPositionGlobal = 8;
+    constexpr std::int64_t kRealizedPnlTicksTotal = 100;
+    constexpr trading::internal::QtyLots kMaxAbsNetPositionPerMarket = 10;
+    constexpr trading::internal::QtyLots kMaxAbsPositionGrossGlobal = 20;
+
+    trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    FakeOmsTransport transport;
+    CollectingOrderEventSink event_sink;
+    FixedPortfolioRiskSnapshotProvider snapshot_provider;
+    snapshot_provider.set_snapshot(trading::oms::PortfolioRiskSnapshot{
+        .net_position_market = kInitialNetPositionMarket,
+        .gross_position_global = kInitialGrossPositionGlobal,
+        .realized_pnl_ticks_total = kRealizedPnlTicksTotal,
+    });
+    trading::oms::OrderManager manager{
+        adapter,
+        transport,
+        event_sink,
+        trading::oms::OrderManagerConfig{
+            .transport =
+                trading::oms::OrderTransportConfig{
+                    .endpoint = "wss://example.test/orders",
+                },
+            .portfolio_risk =
+                trading::oms::PortfolioRiskConfig{
+                    .max_abs_net_position_per_market = kMaxAbsNetPositionPerMarket,
+                    .max_abs_position_gross_global = kMaxAbsPositionGrossGlobal,
+                },
+            .portfolio_snapshot_provider = &snapshot_provider,
+            .loop_idle_sleep = std::chrono::milliseconds{1},
+        },
+    };
+    ASSERT_TRUE(manager.start());
+
+    ASSERT_TRUE(manager
+                    .submit(trading::internal::OrderIntent{
+                        .exchange = trading::internal::ExchangeId::kKalshi,
+                        .action = trading::internal::OmsAction::kPlace,
+                        .client_order_id = "cl-portfolio-allow-1",
+                        .market_ticker = "KXBTC-YES",
+                        .side = trading::internal::Side::kBuy,
+                        .qty_lots = 2,
+                        .limit_price_ticks = 40,
+                        .time_in_force = trading::internal::OmsTimeInForce::kGtc,
+                    })
+                    .has_value());
+    ASSERT_TRUE(wait_until([&transport] { return transport.sent_count() == 1U; },
+                           std::chrono::milliseconds{100}));
+
+    manager.stop();
+    const auto stats = manager.stats();
+    EXPECT_EQ(stats.sent_count, 1U);
+    EXPECT_EQ(stats.risk_reject_count, 0U);
+    EXPECT_EQ(stats.portfolio_risk_reject_count, 0U);
+}
+
+TEST(OrderManagerTest, UsesPositionLedgerSnapshotProviderForPortfolioRisk) {
+    constexpr trading::internal::QtyLots kMaxAbsNetPositionPerMarket = 4;
+
+    trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    FakeOmsTransport transport;
+    CollectingOrderEventSink event_sink;
+    trading::oms::PositionLedger ledger;
+
+    EXPECT_TRUE(ledger.on_order_update(make_fill_update(
+        trading::internal::ExchangeId::kKalshi, "KXBTC-YES", "cl-seed-ledger-1",
+        trading::internal::Side::kBuy, 4, 40, 500)));
+
+    trading::oms::OrderManager manager{
+        adapter,
+        transport,
+        event_sink,
+        trading::oms::OrderManagerConfig{
+            .transport =
+                trading::oms::OrderTransportConfig{
+                    .endpoint = "wss://example.test/orders",
+                },
+            .portfolio_risk =
+                trading::oms::PortfolioRiskConfig{
+                    .max_abs_net_position_per_market = kMaxAbsNetPositionPerMarket,
+                },
+            .portfolio_snapshot_provider = &ledger,
+            .loop_idle_sleep = std::chrono::milliseconds{1},
+        },
+    };
+    ASSERT_TRUE(manager.start());
+
+    ASSERT_TRUE(manager
+                    .submit(trading::internal::OrderIntent{
+                        .exchange = trading::internal::ExchangeId::kKalshi,
+                        .action = trading::internal::OmsAction::kPlace,
+                        .client_order_id = "cl-portfolio-ledger-1",
+                        .market_ticker = "KXBTC-YES",
+                        .side = trading::internal::Side::kBuy,
+                        .qty_lots = 1,
+                        .limit_price_ticks = 40,
+                        .time_in_force = trading::internal::OmsTimeInForce::kGtc,
+                    })
+                    .has_value());
+
+    ASSERT_TRUE(wait_until([&manager] { return manager.stats().portfolio_risk_reject_count == 1U; },
+                           std::chrono::milliseconds{100}));
+    ASSERT_TRUE(wait_until([&event_sink] { return event_sink.update_count() == 1U; },
+                           std::chrono::milliseconds{100}));
+
+    manager.stop();
+    EXPECT_EQ(transport.sent_count(), 0U);
+}
+
 TEST(OrderManagerTest, RejectsUnsupportedIntentBeforeQueueing) {
     trading::adapters::exchanges::kalshi::OmsAdapter adapter;
     FakeOmsTransport transport;
@@ -1600,6 +1917,41 @@ TEST(PositionLedgerTest, IgnoresNonFillUpdates) {
     const auto stats = ledger.stats();
     EXPECT_EQ(stats.processed_fill_count, 0U);
     EXPECT_EQ(stats.ignored_update_count, 1U);
+}
+
+TEST(PositionLedgerTest, BuildsPortfolioRiskSnapshotByExchangeAndMarket) {
+    constexpr trading::internal::QtyLots kBuyQtyLotsA = 10;
+    constexpr trading::internal::QtyLots kSellQtyLotsA = 4;
+    constexpr trading::internal::QtyLots kSellQtyLotsB = 3;
+    constexpr trading::internal::QtyLots kBuyQtyLotsPoly = 2;
+    constexpr std::int64_t kExpectedKalshiRealizedPnl = 60;
+
+    trading::oms::PositionLedger ledger;
+
+    EXPECT_TRUE(ledger.on_order_update(make_fill_update(
+        trading::internal::ExchangeId::kKalshi, "KXBTC-YES", "cl-snap-1",
+        trading::internal::Side::kBuy, kBuyQtyLotsA, 40, 600)));
+    EXPECT_TRUE(ledger.on_order_update(make_fill_update(
+        trading::internal::ExchangeId::kKalshi, "KXBTC-YES", "cl-snap-2",
+        trading::internal::Side::kSell, kSellQtyLotsA, 55, 601)));
+    EXPECT_TRUE(ledger.on_order_update(make_fill_update(
+        trading::internal::ExchangeId::kKalshi, "KXETH-YES", "cl-snap-3",
+        trading::internal::Side::kSell, kSellQtyLotsB, 30, 602)));
+    EXPECT_TRUE(ledger.on_order_update(make_fill_update(
+        trading::internal::ExchangeId::kPolymarket, "POLY-YES", "cl-snap-4",
+        trading::internal::Side::kBuy, kBuyQtyLotsPoly, 70, 603)));
+
+    const auto kalshi_snapshot =
+        ledger.snapshot_for(trading::internal::ExchangeId::kKalshi, "KXBTC-YES");
+    EXPECT_EQ(kalshi_snapshot.net_position_market, 6);
+    EXPECT_EQ(kalshi_snapshot.gross_position_global, 9);
+    EXPECT_EQ(kalshi_snapshot.realized_pnl_ticks_total, kExpectedKalshiRealizedPnl);
+
+    const auto polymarket_snapshot =
+        ledger.snapshot_for(trading::internal::ExchangeId::kPolymarket, "POLY-YES");
+    EXPECT_EQ(polymarket_snapshot.net_position_market, 2);
+    EXPECT_EQ(polymarket_snapshot.gross_position_global, 2);
+    EXPECT_EQ(polymarket_snapshot.realized_pnl_ticks_total, 0);
 }
 
 TEST(WsSessionTest, ConnectBuildsKalshiHeaders) {
