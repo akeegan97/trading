@@ -5,8 +5,9 @@
 namespace trading::shards {
 
 Shard::Shard(ShardConfig config, router::ShardedEventDispatch& dispatch,
-             IExchangeMessageParser& parser, BookStore& books)
-    : config_(config), dispatch_(dispatch), parser_(parser), books_(books) {}
+             IExchangeMessageParser& parser, BookStore& books, IShardEventHandler* event_handler)
+    : config_(config), dispatch_(dispatch), parser_(parser), books_(books),
+      event_handler_(event_handler) {}
 
 Shard::~Shard() { stop(); }
 
@@ -19,6 +20,8 @@ bool Shard::start() {
     parsed_.store(0, std::memory_order_relaxed);
     parse_errors_.store(0, std::memory_order_relaxed);
     applied_.store(0, std::memory_order_relaxed);
+    handler_invoked_.store(0, std::memory_order_relaxed);
+    handler_errors_.store(0, std::memory_order_relaxed);
     // Publish started state to readers of running().
     running_.store(true, std::memory_order_release);
 
@@ -46,6 +49,8 @@ ShardStats Shard::stats() const {
         .parsed = parsed_.load(std::memory_order_relaxed),
         .parse_errors = parse_errors_.load(std::memory_order_relaxed),
         .applied = applied_.load(std::memory_order_relaxed),
+        .handler_invoked = handler_invoked_.load(std::memory_order_relaxed),
+        .handler_errors = handler_errors_.load(std::memory_order_relaxed),
     };
 }
 
@@ -72,6 +77,12 @@ void Shard::run(const std::stop_token& stop_token) {
         parsed_.fetch_add(1, std::memory_order_relaxed);
         if (books_.apply(*parsed_event)) {
             applied_.fetch_add(1, std::memory_order_relaxed);
+            if (event_handler_ != nullptr) {
+                handler_invoked_.fetch_add(1, std::memory_order_relaxed);
+                if (!event_handler_->on_event(*parsed_event)) {
+                    handler_errors_.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
         } else {
             parse_errors_.fetch_add(1, std::memory_order_relaxed);
         }

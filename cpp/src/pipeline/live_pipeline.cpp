@@ -15,15 +15,21 @@ LivePipeline::LivePipeline(LivePipelineConfig config)
               shard_dispatch_.shard_count(), config_.router_exchange) {
     const std::size_t resolved_shard_count = shard_dispatch_.shard_count();
     book_stores_.reserve(resolved_shard_count);
+    shard_event_handlers_.reserve(resolved_shard_count);
     shards_.reserve(resolved_shard_count);
     for (std::size_t shard_id = 0; shard_id < resolved_shard_count; ++shard_id) {
+        std::unique_ptr<shards::IShardEventHandler> event_handler{};
+        if (config_.shard_event_handler_factory) {
+            event_handler = config_.shard_event_handler_factory(shard_id);
+        }
         book_stores_.push_back(std::make_unique<shards::BookStore>());
+        shard_event_handlers_.push_back(std::move(event_handler));
         shards_.push_back(std::make_unique<shards::Shard>(
             shards::ShardConfig{
                 .shard_id = shard_id,
                 .idle_sleep = config_.shard_idle_sleep,
             },
-            shard_dispatch_, parser_, *book_stores_.back()));
+            shard_dispatch_, parser_, *book_stores_.back(), shard_event_handlers_.back().get()));
     }
 }
 

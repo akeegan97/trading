@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -17,12 +18,16 @@
 #include "trading/router/router.hpp"
 #include "trading/router/shard_dispatch.hpp"
 #include "trading/shards/book_store.hpp"
+#include "trading/shards/event_handler.hpp"
 #include "trading/shards/message_parser.hpp"
 #include "trading/shards/shard.hpp"
 
 namespace trading::pipeline {
 
 struct LivePipelineConfig {
+    using ShardEventHandlerFactory =
+        std::function<std::unique_ptr<shards::IShardEventHandler>(std::size_t shard_id)>;
+
     static constexpr std::size_t kDefaultFramePoolCapacity = 8192;
     static constexpr std::size_t kDefaultFrameQueueCapacity = 8192;
     static constexpr std::size_t kDefaultShardCount = 4;
@@ -37,6 +42,7 @@ struct LivePipelineConfig {
     std::size_t shard_count{kDefaultShardCount};
     std::size_t per_shard_queue_capacity{kDefaultPerShardQueueCapacity};
     std::chrono::milliseconds shard_idle_sleep{kDefaultShardIdleSleep};
+    ShardEventHandlerFactory shard_event_handler_factory;
 };
 
 struct LivePipelineStats {
@@ -81,6 +87,7 @@ class LivePipeline final {
     router::Router router_;
     shards::RoutedEventParser parser_;
     std::vector<std::unique_ptr<shards::BookStore>> book_stores_;
+    std::vector<std::unique_ptr<shards::IShardEventHandler>> shard_event_handlers_;
     std::vector<std::unique_ptr<shards::Shard>> shards_;
 
     std::atomic<bool> running_{false};

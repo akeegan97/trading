@@ -1,13 +1,17 @@
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 
 #include "trading/adapters/exchanges/kalshi/auth_signer.hpp"
+#include "trading/adapters/exchanges/kalshi/oms_adapter.hpp"
 #include "trading/adapters/exchanges/kalshi/ws_adapter.hpp"
 #include "trading/adapters/logging/logger.hpp"
 #include "trading/adapters/ws/client.hpp"
@@ -15,7 +19,13 @@
 #include "trading/adapters/ws/session.hpp"
 #include "trading/config/trader_config.hpp"
 #include "trading/engine/runtime.hpp"
+#include "trading/oms/order_manager.hpp"
+#include "trading/oms/position_ledger.hpp"
+#include "trading/oms/ws_order_transport.hpp"
 #include "trading/pipeline/live_pipeline.hpp"
+#include "trading/strategy/noop_strategy.hpp"
+#include "trading/strategy/order_manager_intent_sink.hpp"
+#include "trading/strategy/strategy_event_handler.hpp"
 
 namespace {
 
@@ -24,6 +34,7 @@ constexpr int kExitMissingCredentials = 3;
 constexpr int kExitPipelineStartFailure = 4;
 constexpr int kExitFeedRunnerStartFailure = 5;
 constexpr int kExitConfigLoadFailure = 6;
+constexpr int kExitOmsStartFailure = 7;
 
 std::optional<std::string> get_env(const char* name) {
     const char* value = std::getenv(name);
@@ -84,18 +95,70 @@ int main(int argc, char** argv) {
         return kExitMissingCredentials;
     }
 
+    const trading::adapters::exchanges::kalshi::Credentials kalshi_credentials{
+        .key_id = *key_id,
+        .private_key_pem = *private_key_pem,
+    };
     trading::adapters::exchanges::kalshi::WsAdapter kalshi_adapter{
-        trading::adapters::exchanges::kalshi::AuthSigner{
-            trading::adapters::exchanges::kalshi::Credentials{
-                .key_id = *key_id,
-                .private_key_pem = *private_key_pem,
-            },
-        },
+        trading::adapters::exchanges::kalshi::AuthSigner{kalshi_credentials},
         runtime_config.kalshi.endpoint,
+    };
+
+    const auto oms_auth_headers =
+        trading::adapters::exchanges::kalshi::AuthSigner{kalshi_credentials}.make_ws_headers();
+    trading::adapters::ws::BoostBeastWsTransport oms_ws_transport;
+    trading::oms::WsOrderTransport oms_transport{oms_ws_transport};
+    trading::adapters::exchanges::kalshi::OmsAdapter oms_adapter;
+    trading::oms::PositionLedger position_ledger;
+    trading::oms::OrderManager order_manager{
+        oms_adapter,
+        oms_transport,
+        position_ledger,
+        trading::oms::OrderManagerConfig{
+            .transport =
+                trading::oms::OrderTransportConfig{
+                    .endpoint = runtime_config.kalshi.endpoint,
+                    .headers =
+                        {
+                            {"KALSHI-ACCESS-KEY", oms_auth_headers.key_id},
+                            {"KALSHI-ACCESS-TIMESTAMP", oms_auth_headers.timestamp_ms},
+                            {"KALSHI-ACCESS-SIGNATURE", oms_auth_headers.signature_base64},
+                        },
+                },
+            .portfolio_snapshot_provider = &position_ledger,
+            .loop_idle_sleep = std::chrono::milliseconds{1},
+        },
+    };
+    if (!order_manager.start()) {
+        trading::adapters::logging::log_startup(
+            "trader.error", "failed to start order manager: " + order_manager.last_error());
+        return kExitOmsStartFailure;
+    }
+    trading::strategy::OrderManagerIntentSink strategy_intent_sink{order_manager};
+
+    const std::size_t strategy_shard_count = std::max<std::size_t>(runtime_config.pipeline.shard_count, 1U);
+    std::vector<std::unique_ptr<trading::strategy::NoopStrategy>> shard_strategies;
+    shard_strategies.reserve(strategy_shard_count);
+    for (std::size_t shard_id = 0; shard_id < strategy_shard_count; ++shard_id) {
+        (void)shard_id;
+        shard_strategies.push_back(std::make_unique<trading::strategy::NoopStrategy>());
+    }
+    runtime_config.pipeline.shard_event_handler_factory =
+        [&shard_strategies, &strategy_intent_sink](std::size_t shard_id)
+        -> std::unique_ptr<trading::shards::IShardEventHandler> {
+        if (shard_id >= shard_strategies.size()) {
+            return nullptr;
+        }
+        if (shard_strategies[shard_id] == nullptr) {
+            return nullptr;
+        }
+        return std::make_unique<trading::strategy::StrategyEventHandler>(
+            *shard_strategies[shard_id], strategy_intent_sink);
     };
 
     trading::pipeline::LivePipeline pipeline{runtime_config.pipeline};
     if (!pipeline.start()) {
+        order_manager.stop();
         trading::adapters::logging::log_startup("trader.error", "failed to start pipeline");
         return kExitPipelineStartFailure;
     }
@@ -112,6 +175,7 @@ int main(int argc, char** argv) {
     };
     if (!feed_runner.start()) {
         pipeline.stop();
+        order_manager.stop();
         trading::adapters::logging::log_startup("trader.error", "failed to start ws feed runner");
         return kExitFeedRunnerStartFailure;
     }
@@ -130,16 +194,22 @@ int main(int argc, char** argv) {
 
     feed_runner.stop();
     pipeline.stop();
+    order_manager.stop();
 
     const auto pipeline_stats = pipeline.stats();
     const auto feed_received = feed_runner.received_count();
     const auto feed_dropped = feed_runner.dropped_count();
+    const auto oms_stats = order_manager.stats();
     const std::string summary =
         "frames_pumped=" + std::to_string(pipeline_stats.ingest_frames_pumped) +
         ", routed=" + std::to_string(pipeline_stats.route_success) +
         ", route_drop=" + std::to_string(pipeline_stats.route_drop) +
         ", sink_drop=" + std::to_string(pipeline_stats.ingest_sink_dropped) +
         ", shard_drop=" + std::to_string(pipeline_stats.shard_dispatch_dropped) +
+        ", oms_submitted=" + std::to_string(oms_stats.submitted_count) +
+        ", oms_sent=" + std::to_string(oms_stats.sent_count) +
+        ", oms_rejects=" +
+        std::to_string(oms_stats.risk_reject_count + oms_stats.portfolio_risk_reject_count) +
         ", ws_received=" + std::to_string(feed_received) +
         ", ws_dropped=" + std::to_string(feed_dropped);
     trading::adapters::logging::log_startup("trader.pipeline", summary);
