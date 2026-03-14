@@ -37,9 +37,19 @@ add_library(
   src/oms/portfolio_risk_gate.cpp
   src/oms/position_ledger_core.cpp
   src/oms/position_ledger.cpp
+  src/oms/ws_order_transport.cpp
 )
 target_include_directories(trading_oms_runtime PUBLIC include)
 target_link_libraries(trading_oms_runtime PUBLIC trading_adapters_oms)
+
+add_library(
+  trading_strategy_runtime
+  src/strategy/shard_risk_gate.cpp
+  src/strategy/strategy_event_handler.cpp
+  src/strategy/strategy_runner.cpp
+)
+target_include_directories(trading_strategy_runtime PUBLIC include)
+target_link_libraries(trading_strategy_runtime PUBLIC trading_oms_runtime)
 
 add_library(
   trading_adapters_ws
@@ -87,6 +97,7 @@ target_link_libraries(
   trader_app
   PRIVATE trading_engine
           trading_adapters_logging
+          trading_strategy_runtime
           trading_adapters_ws
           trading_pipeline
 )
@@ -107,6 +118,7 @@ if(BUILD_TESTING)
             trading_engine
             trading_adapters_oms
             trading_oms_runtime
+            trading_strategy_runtime
             trading_adapters_ws
             trading_pipeline
             GTest::gtest_main

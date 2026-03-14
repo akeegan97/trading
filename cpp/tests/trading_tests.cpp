@@ -7,6 +7,7 @@
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -28,12 +29,21 @@
 #include "trading/oms/order_manager.hpp"
 #include "trading/oms/portfolio_risk_gate.hpp"
 #include "trading/oms/position_ledger.hpp"
+#include "trading/oms/ws_order_transport.hpp"
 #include "trading/parsers/exchanges/kalshi/parser.hpp"
 #include "trading/pipeline/live_pipeline.hpp"
 #include "trading/router/router.hpp"
 #include "trading/router/shard_dispatch.hpp"
 #include "trading/shards/book_store.hpp"
+#include "trading/shards/event_handler.hpp"
 #include "trading/shards/message_parser.hpp"
+#include "trading/strategy/order_intent_sink.hpp"
+#include "trading/strategy/order_manager_intent_sink.hpp"
+#include "trading/strategy/shard_risk_gate.hpp"
+#include "trading/strategy/shard_risk_snapshot_provider.hpp"
+#include "trading/strategy/strategy_event_handler.hpp"
+#include "trading/strategy/strategy.hpp"
+#include "trading/strategy/strategy_runner.hpp"
 
 namespace {
 
@@ -422,6 +432,155 @@ class FixedPortfolioRiskSnapshotProvider final
     trading::oms::PortfolioRiskSnapshot snapshot_{};
 };
 
+class FixedShardRiskSnapshotProvider final : public trading::strategy::IShardRiskSnapshotProvider {
+  public:
+    void set_snapshot(const trading::strategy::ShardRiskSnapshot& snapshot) {
+        std::scoped_lock lock{mutex_};
+        snapshot_ = snapshot;
+    }
+
+    [[nodiscard]] trading::strategy::ShardRiskSnapshot
+    snapshot_for(trading::internal::ExchangeId exchange, std::string_view market_ticker) const override {
+        static_cast<void>(exchange);
+        static_cast<void>(market_ticker);
+        std::scoped_lock lock{mutex_};
+        return snapshot_;
+    }
+
+  private:
+    mutable std::mutex mutex_;
+    trading::strategy::ShardRiskSnapshot snapshot_{};
+};
+
+class CollectingOrderIntentSink final : public trading::strategy::IOrderIntentSink {
+  public:
+    bool submit_intent(trading::internal::OrderIntent intent) override {
+        std::scoped_lock lock{mutex_};
+        if (fail_submit_) {
+            return false;
+        }
+        intents_.push_back(std::move(intent));
+        return true;
+    }
+
+    [[nodiscard]] std::string_view last_error() const override { return last_error_; }
+
+    void set_fail_submit(bool fail_submit, std::string error_message = "intent sink rejected intent") {
+        std::scoped_lock lock{mutex_};
+        fail_submit_ = fail_submit;
+        last_error_ = std::move(error_message);
+    }
+
+    [[nodiscard]] std::size_t count() const {
+        std::scoped_lock lock{mutex_};
+        return intents_.size();
+    }
+
+    [[nodiscard]] std::optional<trading::internal::OrderIntent> last_intent() const {
+        std::scoped_lock lock{mutex_};
+        if (intents_.empty()) {
+            return std::nullopt;
+        }
+        return intents_.back();
+    }
+
+  private:
+    mutable std::mutex mutex_;
+    std::vector<trading::internal::OrderIntent> intents_;
+    bool fail_submit_{false};
+    std::string last_error_{"intent sink rejected intent"};
+};
+
+class QueueingWsTransport final : public trading::adapters::ws::IWsTransport {
+  public:
+    bool connect(const trading::adapters::ws::TransportConfig& config) override {
+        config_ = config;
+        if (!connect_result_) {
+            connected_ = false;
+            last_error_ = "connect failed";
+            return false;
+        }
+        connected_ = true;
+        last_error_.clear();
+        return true;
+    }
+
+    bool send_text(std::string_view payload) override {
+        if (!connected_) {
+            last_error_ = "not connected";
+            return false;
+        }
+        sent_messages_.emplace_back(payload);
+        last_error_.clear();
+        return true;
+    }
+
+    std::optional<std::string> recv_text() override {
+        if (inbound_messages_.empty()) {
+            return std::nullopt;
+        }
+        std::string payload = std::move(inbound_messages_.front());
+        inbound_messages_.pop_front();
+        return payload;
+    }
+
+    void close() override { connected_ = false; }
+
+    [[nodiscard]] std::string_view last_error() const override { return last_error_; }
+
+    void set_connect_result(bool connect_result) { connect_result_ = connect_result; }
+
+    void queue_inbound(std::string payload) { inbound_messages_.push_back(std::move(payload)); }
+
+    [[nodiscard]] bool connected() const { return connected_; }
+    [[nodiscard]] const trading::adapters::ws::TransportConfig& config() const { return config_; }
+    [[nodiscard]] const std::vector<std::string>& sent_messages() const { return sent_messages_; }
+
+  private:
+    bool connect_result_{true};
+    bool connected_{false};
+    std::string last_error_;
+    trading::adapters::ws::TransportConfig config_{};
+    std::deque<std::string> inbound_messages_;
+    std::vector<std::string> sent_messages_;
+};
+
+class StaticDecisionStrategy final : public trading::strategy::IStrategy {
+  public:
+    explicit StaticDecisionStrategy(std::vector<trading::internal::OrderIntent> intents = {})
+        : intents_(std::move(intents)) {}
+
+    void set_intents(std::vector<trading::internal::OrderIntent> intents) { intents_ = std::move(intents); }
+    void set_throw(bool should_throw) { should_throw_ = should_throw; }
+
+    [[nodiscard]] trading::strategy::StrategyDecision
+    on_event(const trading::internal::NormalizedEvent& event) override {
+        (void)event;
+        if (should_throw_) {
+            throw std::runtime_error{"strategy failed"};
+        }
+        return trading::strategy::StrategyDecision{.intents = intents_};
+    }
+
+  private:
+    std::vector<trading::internal::OrderIntent> intents_;
+    bool should_throw_{false};
+};
+
+class CountingShardEventHandler final : public trading::shards::IShardEventHandler {
+  public:
+    explicit CountingShardEventHandler(std::atomic<std::uint64_t>& counter) : counter_(counter) {}
+
+    [[nodiscard]] bool on_event(const trading::internal::NormalizedEvent& event) override {
+        (void)event;
+        counter_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+  private:
+    std::atomic<std::uint64_t>& counter_;
+};
+
 TEST(TradingCoreTest, StartupPayloadHasExpectedFields) {
     const auto startup = trading::engine::build_trader_startup_payload("test");
     const auto startup_json = nlohmann::json::parse(startup);
@@ -791,6 +950,285 @@ TEST(PortfolioRiskGateTest, RejectsInvalidIntentSideOrQty) {
 
     EXPECT_FALSE(decision.allow);
     EXPECT_EQ(decision.code, trading::oms::PortfolioRiskRejectCode::kInvalidIntent);
+}
+
+TEST(ShardRiskGateTest, RejectsWhenAbsNetPositionLimitExceeded) {
+    constexpr trading::internal::QtyLots kMaxAbsNetPositionPerMarket = 10;
+    constexpr trading::internal::QtyLots kStartingNetPositionMarket = 9;
+    constexpr trading::internal::QtyLots kIntentQtyLots = 2;
+
+    const trading::strategy::ShardRiskGate gate{
+        trading::strategy::ShardRiskConfig{
+            .max_abs_net_position_per_market = kMaxAbsNetPositionPerMarket,
+        },
+    };
+
+    const auto decision = gate.evaluate(
+        trading::internal::OrderIntent{
+            .exchange = trading::internal::ExchangeId::kKalshi,
+            .action = trading::internal::OmsAction::kPlace,
+            .market_ticker = "KXBTC-YES",
+            .side = trading::internal::Side::kBuy,
+            .qty_lots = kIntentQtyLots,
+        },
+        trading::strategy::ShardRiskSnapshot{
+            .net_position_market = kStartingNetPositionMarket,
+        });
+
+    EXPECT_FALSE(decision.allow);
+    EXPECT_EQ(decision.code, trading::strategy::ShardRiskRejectCode::kAbsNetPositionPerMarketLimit);
+}
+
+TEST(ShardRiskGateTest, AllowsCancelRegardlessOfLimits) {
+    const trading::strategy::ShardRiskGate gate{
+        trading::strategy::ShardRiskConfig{
+            .max_open_orders_per_market = 1,
+            .max_working_qty_per_market = 1,
+            .max_abs_net_position_per_market = 1,
+        },
+    };
+
+    const auto decision = gate.evaluate(
+        trading::internal::OrderIntent{
+            .exchange = trading::internal::ExchangeId::kKalshi,
+            .action = trading::internal::OmsAction::kCancel,
+            .market_ticker = "KXBTC-YES",
+            .side = trading::internal::Side::kUnknown,
+            .qty_lots = 0,
+        },
+        trading::strategy::ShardRiskSnapshot{
+            .open_orders_market = 100,
+            .working_qty_market = 1'000,
+            .net_position_market = 1'000,
+        });
+
+    EXPECT_TRUE(decision.allow);
+    EXPECT_EQ(decision.code, trading::strategy::ShardRiskRejectCode::kNone);
+}
+
+TEST(StrategyRunnerTest, SubmitsStrategyIntentsWhenRiskAllows) {
+    constexpr trading::internal::TimestampNs kEventRecvTsNs = 777;
+    constexpr trading::internal::QtyLots kIntentQtyLots = 2;
+    constexpr trading::internal::QtyLots kMaxAbsNetPositionPerMarket = 10;
+
+    StaticDecisionStrategy strategy{
+        std::vector<trading::internal::OrderIntent>{
+            trading::internal::OrderIntent{
+                .action = trading::internal::OmsAction::kPlace,
+                .client_order_id = "cl-strategy-1",
+                .side = trading::internal::Side::kBuy,
+                .qty_lots = kIntentQtyLots,
+            },
+        },
+    };
+    CollectingOrderIntentSink intent_sink;
+    FixedShardRiskSnapshotProvider snapshot_provider;
+    snapshot_provider.set_snapshot(trading::strategy::ShardRiskSnapshot{
+        .open_orders_market = 0,
+        .working_qty_market = 0,
+        .net_position_market = 0,
+    });
+    trading::strategy::StrategyRunner runner{
+        strategy,
+        intent_sink,
+        trading::strategy::StrategyRunnerConfig{
+            .shard_risk =
+                trading::strategy::ShardRiskConfig{
+                    .max_abs_net_position_per_market = kMaxAbsNetPositionPerMarket,
+                },
+            .risk_snapshot_provider = &snapshot_provider,
+        },
+    };
+
+    const trading::internal::NormalizedEvent event{
+        .type = trading::internal::EventType::kDelta,
+        .meta =
+            trading::internal::EventMeta{
+                .exchange = trading::internal::ExchangeId::kKalshi,
+                .recv_ns = kEventRecvTsNs,
+            },
+        .market_ticker = "KXBTC-YES",
+        .raw_sequence_id = std::nullopt,
+        .data =
+            trading::internal::DeltaData{
+                .side = trading::internal::Side::kBuy,
+                .price_ticks = 40,
+                .delta_qty_lots = 1,
+            },
+        .raw_payload = "{}",
+    };
+
+    EXPECT_TRUE(runner.on_event(event));
+    EXPECT_EQ(intent_sink.count(), 1U);
+
+    const auto submitted_intent = intent_sink.last_intent();
+    ASSERT_TRUE(submitted_intent.has_value());
+    const auto submitted_intent_value =
+        submitted_intent.value_or(trading::internal::OrderIntent{});
+    EXPECT_EQ(submitted_intent_value.exchange, trading::internal::ExchangeId::kKalshi);
+    EXPECT_EQ(submitted_intent_value.market_ticker, "KXBTC-YES");
+    EXPECT_EQ(submitted_intent_value.intent_ts_ns, kEventRecvTsNs);
+
+    const auto stats = runner.stats();
+    EXPECT_EQ(stats.events_processed_count, 1U);
+    EXPECT_EQ(stats.intents_emitted_count, 1U);
+    EXPECT_EQ(stats.intents_submitted_count, 1U);
+    EXPECT_EQ(stats.risk_reject_count, 0U);
+    EXPECT_EQ(stats.sink_reject_count, 0U);
+    EXPECT_EQ(stats.strategy_error_count, 0U);
+}
+
+TEST(StrategyRunnerTest, RejectsIntentWhenShardRiskTrips) {
+    constexpr trading::internal::QtyLots kStartingNetPositionMarket = 9;
+    constexpr trading::internal::QtyLots kMaxAbsNetPositionPerMarket = 10;
+
+    StaticDecisionStrategy strategy{
+        std::vector<trading::internal::OrderIntent>{
+            trading::internal::OrderIntent{
+                .exchange = trading::internal::ExchangeId::kKalshi,
+                .action = trading::internal::OmsAction::kPlace,
+                .client_order_id = "cl-strategy-risk-1",
+                .market_ticker = "KXBTC-YES",
+                .side = trading::internal::Side::kBuy,
+                .qty_lots = 2,
+            },
+        },
+    };
+    CollectingOrderIntentSink intent_sink;
+    FixedShardRiskSnapshotProvider snapshot_provider;
+    snapshot_provider.set_snapshot(trading::strategy::ShardRiskSnapshot{
+        .net_position_market = kStartingNetPositionMarket,
+    });
+    trading::strategy::StrategyRunner runner{
+        strategy,
+        intent_sink,
+        trading::strategy::StrategyRunnerConfig{
+            .shard_risk =
+                trading::strategy::ShardRiskConfig{
+                    .max_abs_net_position_per_market = kMaxAbsNetPositionPerMarket,
+                },
+            .risk_snapshot_provider = &snapshot_provider,
+        },
+    };
+
+    const auto event = make_trade_event("KXBTC-YES", std::nullopt, 40, 1);
+    EXPECT_TRUE(runner.on_event(event));
+    EXPECT_EQ(intent_sink.count(), 0U);
+    EXPECT_EQ(runner.stats().risk_reject_count, 1U);
+    EXPECT_EQ(runner.last_error(), "shard risk reject: max_abs_net_position_per_market exceeded");
+}
+
+TEST(StrategyRunnerTest, TracksSinkRejectAndStrategyException) {
+    StaticDecisionStrategy strategy{
+        std::vector<trading::internal::OrderIntent>{
+            trading::internal::OrderIntent{
+                .exchange = trading::internal::ExchangeId::kKalshi,
+                .action = trading::internal::OmsAction::kPlace,
+                .client_order_id = "cl-strategy-sink-1",
+                .market_ticker = "KXBTC-YES",
+                .side = trading::internal::Side::kBuy,
+                .qty_lots = 1,
+            },
+        },
+    };
+    CollectingOrderIntentSink intent_sink;
+    intent_sink.set_fail_submit(true, "sink unavailable");
+    trading::strategy::StrategyRunner runner{strategy, intent_sink};
+
+    const auto event = make_trade_event("KXBTC-YES", std::nullopt, 40, 1);
+    EXPECT_TRUE(runner.on_event(event));
+    EXPECT_EQ(runner.stats().sink_reject_count, 1U);
+    EXPECT_EQ(runner.last_error(), "sink unavailable");
+
+    strategy.set_throw(true);
+    EXPECT_FALSE(runner.on_event(event));
+    EXPECT_EQ(runner.stats().strategy_error_count, 1U);
+    EXPECT_EQ(runner.last_error(), "strategy failed");
+}
+
+TEST(StrategyEventHandlerTest, DelegatesToRunnerAndIntentSink) {
+    StaticDecisionStrategy strategy{
+        std::vector<trading::internal::OrderIntent>{
+            trading::internal::OrderIntent{
+                .action = trading::internal::OmsAction::kPlace,
+                .client_order_id = "cl-handler-1",
+                .side = trading::internal::Side::kBuy,
+                .qty_lots = 1,
+            },
+        },
+    };
+    CollectingOrderIntentSink intent_sink;
+    trading::strategy::StrategyEventHandler handler{strategy, intent_sink};
+
+    const auto event = make_trade_event("KXBTC-YES", std::nullopt, 42, 1);
+    EXPECT_TRUE(handler.on_event(event));
+    EXPECT_EQ(intent_sink.count(), 1U);
+    EXPECT_EQ(handler.stats().intents_submitted_count, 1U);
+}
+
+TEST(OrderManagerIntentSinkTest, SubmitsIntentIntoOrderManager) {
+    trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    FakeOmsTransport transport;
+    CollectingOrderEventSink event_sink;
+    trading::oms::OrderManager manager{
+        adapter,
+        transport,
+        event_sink,
+        trading::oms::OrderManagerConfig{
+            .transport = trading::oms::OrderTransportConfig{
+                .endpoint = "wss://example.test/orders",
+            },
+        },
+    };
+
+    ASSERT_TRUE(manager.start());
+    trading::strategy::OrderManagerIntentSink sink{manager};
+
+    EXPECT_TRUE(sink.submit_intent(trading::internal::OrderIntent{
+        .exchange = trading::internal::ExchangeId::kKalshi,
+        .action = trading::internal::OmsAction::kPlace,
+        .client_order_id = "cl-strategy-oms-1",
+        .market_ticker = "KXBTC-YES",
+        .side = trading::internal::Side::kBuy,
+        .qty_lots = 2,
+        .limit_price_ticks = 45,
+    }));
+
+    EXPECT_TRUE(wait_until([&transport] { return transport.sent_count() == 1U; },
+                           std::chrono::milliseconds{50}));
+    EXPECT_TRUE(sink.last_error().empty());
+    manager.stop();
+}
+
+TEST(OrderManagerIntentSinkTest, SurfacesOrderManagerErrorOnReject) {
+    trading::adapters::exchanges::kalshi::OmsAdapter adapter;
+    FakeOmsTransport transport;
+    CollectingOrderEventSink event_sink;
+    trading::oms::OrderManager manager{
+        adapter,
+        transport,
+        event_sink,
+        trading::oms::OrderManagerConfig{
+            .transport = trading::oms::OrderTransportConfig{
+                .endpoint = "wss://example.test/orders",
+            },
+        },
+    };
+
+    ASSERT_TRUE(manager.start());
+    trading::strategy::OrderManagerIntentSink sink{manager};
+
+    EXPECT_FALSE(sink.submit_intent(trading::internal::OrderIntent{
+        .exchange = trading::internal::ExchangeId::kPolymarket,
+        .action = trading::internal::OmsAction::kPlace,
+        .client_order_id = "cl-strategy-oms-bad-1",
+        .market_ticker = "POLY-YES",
+        .side = trading::internal::Side::kBuy,
+        .qty_lots = 1,
+        .limit_price_ticks = 55,
+    }));
+    EXPECT_EQ(sink.last_error(), "Order intent is not supported by adapter");
+    manager.stop();
 }
 
 TEST(OrderManagerTest, SendsIntentToTransport) {
@@ -1954,6 +2392,48 @@ TEST(PositionLedgerTest, BuildsPortfolioRiskSnapshotByExchangeAndMarket) {
     EXPECT_EQ(polymarket_snapshot.realized_pnl_ticks_total, 0);
 }
 
+TEST(WsOrderTransportTest, ProxiesWsTransportConnectSendRecvAndClose) {
+    QueueingWsTransport ws_transport;
+    trading::oms::WsOrderTransport transport{ws_transport};
+
+    const trading::oms::OrderTransportConfig config{
+        .endpoint = "wss://example.test/orders",
+        .headers = {
+            {"KALSHI-ACCESS-KEY", "key"},
+            {"KALSHI-ACCESS-TIMESTAMP", "123"},
+            {"KALSHI-ACCESS-SIGNATURE", "sig"},
+        },
+    };
+
+    ASSERT_TRUE(transport.connect(config));
+    EXPECT_TRUE(ws_transport.connected());
+    EXPECT_EQ(ws_transport.config().endpoint, config.endpoint);
+    EXPECT_EQ(ws_transport.config().headers.at("KALSHI-ACCESS-KEY"), "key");
+
+    EXPECT_TRUE(transport.send_text(R"({"type":"order.place"})"));
+    ASSERT_EQ(ws_transport.sent_messages().size(), 1U);
+    EXPECT_EQ(ws_transport.sent_messages().front(), R"({"type":"order.place"})");
+
+    ws_transport.queue_inbound(R"({"type":"order_ack"})");
+    const auto inbound = transport.recv_text();
+    ASSERT_TRUE(inbound.has_value());
+    EXPECT_EQ(inbound.value_or(""), R"({"type":"order_ack"})");
+
+    transport.close();
+    EXPECT_FALSE(ws_transport.connected());
+}
+
+TEST(WsOrderTransportTest, ForwardsLastErrorFromWsTransport) {
+    QueueingWsTransport ws_transport;
+    ws_transport.set_connect_result(false);
+    trading::oms::WsOrderTransport transport{ws_transport};
+
+    EXPECT_FALSE(transport.connect(trading::oms::OrderTransportConfig{
+        .endpoint = "wss://example.test/orders",
+    }));
+    EXPECT_EQ(transport.last_error(), "connect failed");
+}
+
 TEST(WsSessionTest, ConnectBuildsKalshiHeaders) {
     const auto kalshi_adapter = make_kalshi_adapter();
     trading::tests::FakeWsTransport transport;
@@ -2423,6 +2903,74 @@ TEST(LivePipelineTest, RoutesMessageFromSinkThroughRouterIntoShardBooks) {
     EXPECT_TRUE(found_book);
     EXPECT_GE(pipeline_stats.ingest_frames_pumped, 1U);
     EXPECT_GE(pipeline_stats.route_success, 1U);
+}
+// NOLINTEND(readability-function-cognitive-complexity)
+
+// NOLINTBEGIN(readability-function-cognitive-complexity)
+TEST(LivePipelineTest, InvokesPerShardEventHandlers) {
+    constexpr std::string_view kPayload = R"({
+        "type": "orderbook_snapshot",
+        "sid": 3,
+        "seq": 2,
+        "msg": {
+            "market_ticker": "FED-23DEC-T3.00",
+            "yes": [[95, 54], [94, 1]],
+            "no": [[7, 87], [6, 32]]
+        }
+    })";
+    constexpr std::size_t kQueueCapacity = 64;
+    constexpr std::size_t kShardCount = 4;
+    constexpr int kMaxAttempts = 200;
+
+    std::vector<std::unique_ptr<std::atomic<std::uint64_t>>> invocation_counters;
+    invocation_counters.reserve(kShardCount);
+    for (std::size_t shard_id = 0; shard_id < kShardCount; ++shard_id) {
+        invocation_counters.push_back(std::make_unique<std::atomic<std::uint64_t>>(0U));
+    }
+
+    trading::pipeline::LivePipeline pipeline{
+        trading::pipeline::LivePipelineConfig{
+            .source = "kalshi",
+            .decode_exchange = trading::decode::ExchangeId::kKalshi,
+            .router_exchange = trading::internal::ExchangeId::kKalshi,
+            .frame_pool_capacity = kQueueCapacity,
+            .frame_queue_capacity = kQueueCapacity,
+            .shard_count = kShardCount,
+            .per_shard_queue_capacity = kQueueCapacity,
+            .shard_idle_sleep = std::chrono::milliseconds{1},
+            .shard_event_handler_factory =
+                [&invocation_counters](std::size_t shard_id) -> std::unique_ptr<trading::shards::IShardEventHandler> {
+                if (shard_id >= invocation_counters.size() || invocation_counters[shard_id] == nullptr) {
+                    return nullptr;
+                }
+                return std::make_unique<CountingShardEventHandler>(*invocation_counters[shard_id]);
+            },
+        },
+    };
+    ASSERT_TRUE(pipeline.start());
+
+    auto& sink = pipeline.message_sink();
+    ASSERT_TRUE(sink.push_message(std::string{kPayload}));
+
+    bool handler_invoked = false;
+    for (int attempt = 0; attempt < kMaxAttempts && !handler_invoked; ++attempt) {
+        (void)pipeline.pump_ingest(kQueueCapacity);
+        for (const auto& invocation_counter : invocation_counters) {
+            if (invocation_counter == nullptr) {
+                continue;
+            }
+            if (invocation_counter->load(std::memory_order_relaxed) > 0U) {
+                handler_invoked = true;
+                break;
+            }
+        }
+        if (!handler_invoked) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+    }
+
+    pipeline.stop();
+    EXPECT_TRUE(handler_invoked);
 }
 // NOLINTEND(readability-function-cognitive-complexity)
 
