@@ -168,6 +168,7 @@ OrderManager::in_flight_order(std::string_view client_order_id) const {
         .exchange_order_id = order.exchange_order_id,
         .replace_target_client_order_id = order.replace_target_client_order_id,
         .market_ticker = order.market_ticker,
+        .side = order.side,
         .requested_qty_lots = order.requested_qty_lots,
         .filled_qty_lots = order.filled_qty_lots,
         .created_ts_ns = order.created_ts_ns,
@@ -313,7 +314,7 @@ bool OrderManager::pump_incoming_update() {
         return true;
     }
 
-    const internal::OrderStateUpdate& update = *parsed_update;
+    internal::OrderStateUpdate update = *parsed_update;
     if (!apply_update_transition(update)) {
         update_drop_count_.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -347,6 +348,7 @@ bool OrderManager::validate_and_track_submission(internal::OrderRequestId reques
             .status = InFlightStatus::kPending,
             .client_order_id = intent.client_order_id,
             .market_ticker = intent.market_ticker,
+            .side = intent.side,
             .requested_qty_lots = intent.qty_lots,
             .created_ts_ns = intent.intent_ts_ns,
         };
@@ -426,6 +428,7 @@ bool OrderManager::validate_and_track_submission(internal::OrderRequestId reques
             .replace_target_client_order_id = resolved_target_id,
             .market_ticker = !intent.market_ticker.empty() ? intent.market_ticker
                                                            : target_it->second.market_ticker,
+            .side = intent.side != internal::Side::kUnknown ? intent.side : target_it->second.side,
             .requested_qty_lots =
                 intent.qty_lots > 0 ? intent.qty_lots : target_it->second.requested_qty_lots,
             .created_ts_ns = intent.intent_ts_ns,
@@ -437,7 +440,7 @@ bool OrderManager::validate_and_track_submission(internal::OrderRequestId reques
 }
 // NOLINTEND(readability-function-cognitive-complexity)
 
-bool OrderManager::apply_update_transition(const internal::OrderStateUpdate& update) {
+bool OrderManager::apply_update_transition(internal::OrderStateUpdate& update) {
     const auto next_status = to_in_flight_status(update.status);
     if (!next_status.has_value()) {
         transition_reject_count_.fetch_add(1, std::memory_order_relaxed);
@@ -481,7 +484,13 @@ bool OrderManager::apply_update_transition(const internal::OrderStateUpdate& upd
         exchange_to_client_[*update.exchange_order_id] = order.client_order_id;
     }
 
-    if (const auto* fill = std::get_if<internal::OrderFill>(&update.data); fill != nullptr) {
+    if (auto* fill = std::get_if<internal::OrderFill>(&update.data); fill != nullptr) {
+        if (fill->side == internal::Side::kUnknown && order.side != internal::Side::kUnknown) {
+            fill->side = order.side;
+        }
+        if (order.side == internal::Side::kUnknown && fill->side != internal::Side::kUnknown) {
+            order.side = fill->side;
+        }
         if (*next_status == InFlightStatus::kFilled && order.requested_qty_lots > 0) {
             order.filled_qty_lots = order.requested_qty_lots;
         } else if (fill->fill_qty_lots > order.filled_qty_lots) {
@@ -530,7 +539,7 @@ internal::QtyLots OrderManager::outstanding_qty(const InFlightOrder& order) {
 
 void OrderManager::emit_global_risk_reject(const PendingIntent& pending_intent,
                                            const GlobalRiskDecision& decision) {
-    const internal::OrderStateUpdate update{
+    internal::OrderStateUpdate update{
         .exchange = pending_intent.intent.exchange,
         .status = internal::OmsOrderStatus::kRejected,
         .client_order_id = pending_intent.intent.client_order_id,

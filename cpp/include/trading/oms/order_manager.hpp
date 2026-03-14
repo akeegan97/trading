@@ -64,6 +64,7 @@ struct InFlightOrderSnapshot {
     std::optional<internal::ExchangeOrderId> exchange_order_id;
     std::optional<internal::ClientOrderId> replace_target_client_order_id;
     std::string market_ticker;
+    internal::Side side{internal::Side::kUnknown};
     internal::QtyLots requested_qty_lots{0};
     internal::QtyLots filled_qty_lots{0};
     internal::TimestampNs created_ts_ns{0};
@@ -105,6 +106,7 @@ class OrderManager final {
         std::optional<internal::ExchangeOrderId> exchange_order_id;
         std::optional<internal::ClientOrderId> replace_target_client_order_id;
         std::string market_ticker;
+        internal::Side side{internal::Side::kUnknown};
         internal::QtyLots requested_qty_lots{0};
         internal::QtyLots filled_qty_lots{0};
         internal::TimestampNs created_ts_ns{0};
@@ -123,7 +125,7 @@ class OrderManager final {
     [[nodiscard]] bool validate_and_track_submission(internal::OrderRequestId request_id,
                                                      const internal::OrderIntent& intent,
                                                      std::string& error_message);
-    [[nodiscard]] bool apply_update_transition(const internal::OrderStateUpdate& update);
+    [[nodiscard]] bool apply_update_transition(internal::OrderStateUpdate& update);
     [[nodiscard]] GlobalRiskSnapshot
     build_risk_snapshot(std::string_view market_ticker,
                         std::string_view skip_client_order_id) const;
